@@ -1,0 +1,10 @@
+[package]
+name = "pwasm-api"
+version = "0.1.0"
+authors = ["Jef <jackefransham@gmail.com>"]
+
+[dependencies]
+pwasm-ethereum = "0.3.0"
+
+[patch.crates-io]
+wee_alloc = { git = "https://github.com/rustwasm/wee_alloc.git" }
