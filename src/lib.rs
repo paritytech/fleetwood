@@ -1,10 +1,12 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(feature = "nightly", feature(overlapping_marker_traits))]
+#![feature(never_type)]
 #![allow(dead_code)]
 
 extern crate serde;
-
+extern crate either;
 extern crate core;
+extern crate tiny_keccak;
 
 pub mod shim {
     pub struct U256(());
@@ -27,10 +29,20 @@ pub mod shim {
             unimplemented!()
         }
     }
+
     pub fn write(_key: &H256, _val: &[u8; 32]) {
         unimplemented!()
     }
+
     pub fn read(_key: &H256) -> [u8; 32] {
+        unimplemented!()
+    }
+
+    pub fn write_state(_len: usize, _ptr: *const u8) {
+        unimplemented!()
+    }
+
+    pub fn read_state(_len: usize, _ptr: *mut u8) {
         unimplemented!()
     }
 }
@@ -38,6 +50,7 @@ pub mod shim {
 use shim as pwasm_ethereum;
 
 mod pwasm {
+    use core::hash::Hash;
     use core::iter;
     use core::marker::PhantomData;
     use core::result::Result as StdResult;
@@ -46,6 +59,23 @@ mod pwasm {
 
     use serde::{Deserialize, Serialize};
 
+    // Replacement for `HashMap` that doesn't require serializing/deserializing the
+    // full map every time you attempt to run a handler.
+    pub struct Database<K, V> {
+        seed: u64,
+        _marker: PhantomData<(K, V)>,
+    }
+
+    impl<K: Hash, V: Serialize + for<'a> Deserialize<'a>> Database<K, V> {
+        fn insert(&mut self, _key: &K, _val: V) {
+            unimplemented!()
+        }
+
+        fn get(&self, _key: &K) -> V {
+            unimplemented!()
+        }
+    }
+
     pub struct NoMethodError;
 
     pub struct TxInfo(());
@@ -53,10 +83,28 @@ mod pwasm {
     pub type Result<T> = StdResult<T, NoMethodError>;
 
     pub struct Request {
-        message_name: &'static str,
+        pub function_selector: [u8; 4],
     }
 
-    pub struct Response(());
+    // For testing
+    impl Request {
+        pub fn new<M: Message>(_input: M::Input) -> Self {
+            let mut keccak = ::tiny_keccak::Keccak::new_sha3_256();
+            for element in M::signature() {
+                keccak.update(element.as_bytes());
+            }
+            let mut out = [0u8; 4];
+            keccak.finalize(&mut out);
+
+            Request {
+                function_selector: out,
+            }
+        }
+    }
+
+    pub trait Response<To: Message> {
+        fn to(data: To::Output) -> Self;
+    }
 
     pub fn deploy_data() -> DeployData {
         DeployData {
@@ -64,28 +112,68 @@ mod pwasm {
         }
     }
 
-    pub trait ContractDef {
-        fn handle_message(self, input: Request) -> Response;
+    pub trait ContractDef<State> {
+        type Output;
+
+        fn handle_message(self, state: &mut State, input: Request) -> Self::Output;
     }
 
-    impl<C, Handlers> ContractDef for Contract<C, Handlers> {
-        fn handle_message(self, _input: Request) -> Response {
+    impl<C, H> ContractDef<C::Output> for Contract<C, H>
+    where
+        C: Constructor,
+        H: Handlers<C::Output>,
+    {
+        type Output = H::Output;
+
+        fn handle_message(self, _state: &mut C::Output, _input: Request) -> Self::Output {
             unimplemented!()
         }
     }
 
-    pub trait Handlers<State> {
-        fn handle(self, env: &EthEnv, state: State, name: &str, msg_data: &[u8]) -> Result<()>;
-    }
-
-    pub struct MessageHandler<State, F> {
+    pub struct MessageHandler<F, SW> {
         handler: F,
-        write_state: for<'a> fn(&'a State),
+        write_state: PhantomData<SW>,
     }
 
-    impl<F: Copy, State> Copy for MessageHandler<State, F> {}
+    pub trait StateWriter<State> {
+        fn write_state(state: &State);
+    }
 
-    impl<F: Clone, State> Clone for MessageHandler<State, F> {
+    pub struct NoWriteState;
+    pub struct WriteState;
+
+    impl<S> StateWriter<S> for NoWriteState {
+        fn write_state(_state: &S) {
+        }
+    }
+
+    impl<S> StateWriter<S> for WriteState {
+        fn write_state(state: &S) {
+            write_state_generic(state)
+        }
+    }
+
+    impl<F> MessageHandler<F, NoWriteState> {
+        fn new(hnd: F) -> Self {
+            MessageHandler {
+                handler: hnd,
+                write_state: PhantomData,
+            }
+        }
+    }
+
+    impl<F> MessageHandler<F, WriteState> {
+        fn new_mut(hnd: F) -> Self {
+            MessageHandler {
+                handler: hnd,
+                write_state: PhantomData,
+            }
+        }
+    }
+
+    impl<F: Copy, S> Copy for MessageHandler<F, S> {}
+
+    impl<F: Clone, S> Clone for MessageHandler<F, S> {
         fn clone(&self) -> Self {
             MessageHandler {
                 handler: self.handler.clone(),
@@ -94,15 +182,26 @@ mod pwasm {
         }
     }
 
-    impl<M, Rest, F, State> Handlers<State> for ((PhantomData<M>, MessageHandler<State, F>), Rest)
+    pub trait Handlers<State> {
+        type Output;
+
+        fn handle(self, env: &EthEnv, state: State, name: &str, msg_data: &[u8]) -> Result<()>;
+    }
+
+    use either::Either;
+
+    macro_rules! impl_handlers {
+        ($statename:ident, $($any:tt)*) => {
+    impl<M, Rest, $statename, SW> Handlers<$statename> for ((PhantomData<M>, MessageHandler<for<'a> fn(&'a EthEnv, &'a $($any)*, M::Input) -> M::Output, SW>), Rest)
     where
         M: Message,
-        Rest: Handlers<State>,
-        F: for<'a> FnOnce(&'a EthEnv, &'a mut State, <M as Message>::Input)
-            -> <M as Message>::Output,
+        Rest: Handlers<$statename>,
+        SW: StateWriter<$statename>,
     {
+        type Output = Either<<M as Message>::Output, <Rest as Handlers<$statename>>::Output>;
+
         // TODO: Pre-hash?
-        fn handle(self, env: &EthEnv, mut state: State, name: &str, msg_data: &[u8]) -> Result<()> {
+        fn handle(self, env: &EthEnv, mut state: $statename, name: &str, msg_data: &[u8]) -> Result<()> {
             fn deserialize<In, Out>(_: In) -> Out {
                 unimplemented!()
             }
@@ -110,22 +209,29 @@ mod pwasm {
             if M::NAME == name {
                 let head = self.0;
                 (head.1.handler)(env, &mut state, deserialize(msg_data));
-                (head.1.write_state)(&state);
+                SW::write_state(&state);
                 Ok(())
             } else {
                 self.1.handle(env, state, name, msg_data)
             }
         }
     }
-
-    fn write_state_generic<T>(val: &T) {
-        unsafe { write_state(::core::mem::size_of::<T>(), val as *const T as *const u8) };
+        }
     }
 
+    impl_handlers!(State, State);
+    impl_handlers!(State, mut State);
+
     impl<State> Handlers<State> for () {
+        type Output = !;
+
         fn handle(self, _env: &EthEnv, _state: State, _name: &str, _msg_data: &[u8]) -> Result<()> {
             Err(NoMethodError)
         }
+    }
+
+    fn write_state_generic<T>(val: &T) {
+        unsafe { write_state(::core::mem::size_of::<T>(), val as *const T as *const u8) };
     }
 
     pub trait ArgSignature {
@@ -138,22 +244,6 @@ mod pwasm {
     pub trait SolidityType {
         type Iter: IntoIterator<Item = &'static str>;
         fn solname() -> Self::Iter;
-    }
-
-    impl<T> ArgSignature for T
-    where
-        T: SolidityType,
-    {
-        type Iter = iter::Chain<
-            iter::Chain<iter::Once<&'static str>, <T::Iter as IntoIterator>::IntoIter>,
-            iter::Once<&'static str>,
-        >;
-
-        fn arg_sig() -> Self::Iter {
-            iter::once("(")
-                .chain(T::solname().into_iter())
-                .chain(iter::once(")"))
-        }
     }
 
     macro_rules! impl_soltype {
@@ -211,6 +301,22 @@ mod pwasm {
 
         fn solname() -> Self::Iter {
             T::solname().into_iter().chain(iter::once("[]"))
+        }
+    }
+
+    impl<T> ArgSignature for T
+    where
+        T: SolidityType,
+    {
+        type Iter = iter::Chain<
+            iter::Chain<iter::Once<&'static str>, <T::Iter as IntoIterator>::IntoIter>,
+            iter::Once<&'static str>,
+        >;
+
+        fn arg_sig() -> Self::Iter {
+            iter::once("(")
+                .chain(T::solname().into_iter())
+                .chain(iter::once(")"))
         }
     }
 
@@ -376,11 +482,10 @@ mod pwasm {
         // We can't make this return an `impl Trait`-style result because it would require
         // HKT.
 
-        pub fn with_handler<M, H>(
+        fn with_handler<M, H, SW>(
             self,
             handler: H,
-            write_state: for<'a> fn(&'a Cons::Output),
-        ) -> Contract<Cons, ((PhantomData<M>, MessageHandler<Cons::Output, H>), Handle)> {
+        ) -> Contract<Cons, ((PhantomData<M>, MessageHandler<H, SW>), Handle)> {
             Contract {
                 constructor: self.constructor,
                 handlers: (
@@ -388,7 +493,7 @@ mod pwasm {
                         PhantomData,
                         MessageHandler {
                             handler,
-                            write_state,
+                            write_state: PhantomData,
                         },
                     ),
                     self.handlers,
@@ -404,7 +509,7 @@ mod pwasm {
             (
                 (
                     PhantomData<M>,
-                    MessageHandler<Cons::Output, Handler<M, Cons::Output>>,
+                    MessageHandler<Handler<M, Cons::Output>, NoWriteState>,
                 ),
                 Handle,
             ),
@@ -412,7 +517,7 @@ mod pwasm {
         where
             M: Message,
         {
-            self.with_handler(handler, write_state_generic)
+            self.with_handler(handler)
         }
 
         pub fn on_msg_mut<M>(
@@ -423,7 +528,7 @@ mod pwasm {
             (
                 (
                     PhantomData<M>,
-                    MessageHandler<Cons::Output, HandlerMut<M, Cons::Output>>,
+                    MessageHandler<HandlerMut<M, Cons::Output>, WriteState>,
                 ),
                 Handle,
             ),
@@ -431,7 +536,7 @@ mod pwasm {
         where
             M: Message,
         {
-            self.with_handler(handler, |_| {})
+            self.with_handler(handler)
         }
     }
 
@@ -476,6 +581,8 @@ mod pwasm {
 
     pub struct EthEnv(());
 
+    pub trait RemoteContract {}
+
     impl EthEnv {
         // TODO: Do we use an owned blockchain since everything's accessed through methods
         //       anyway?
@@ -491,27 +598,19 @@ mod pwasm {
         // they require different functions to get the code
 
         // `impl Contract` is a `RemoteContract`
-        fn contract_at(&self, _addr: U256) -> Result<&impl ContractDef> {
+        fn contract_at(&self, _addr: U256) -> Result<&impl RemoteContract> {
             struct Dummy;
 
-            impl ContractDef for Dummy {
-                fn handle_message(self, _: Request) -> Response {
-                    unimplemented!()
-                }
-            }
+            impl RemoteContract for Dummy {}
 
             Ok(&Dummy)
         }
 
         // `impl Contract` is a `LocalContract`
-        fn current_contract(&self) -> Result<&impl ContractDef> {
+        fn current_contract(&self) -> Result<&impl RemoteContract> {
             struct Dummy;
 
-            impl ContractDef for Dummy {
-                fn handle_message(self, _input: Request) -> Response {
-                    unimplemented!()
-                }
-            }
+            impl RemoteContract for Dummy {}
 
             Ok(&Dummy)
         }
@@ -623,12 +722,12 @@ mod example {
         Get() -> u32;
     }
 
-    struct State {
+    pub struct State {
         current: u32,
         calls_to_add: usize,
     }
 
-    pub fn contract() -> impl ContractDef {
+    pub fn contract() -> impl ContractDef<State> {
         let _deploy_info: ::pwasm::DeployData = pwasm::deploy_data();
 
         Contract::new()
@@ -661,29 +760,37 @@ mod test {
         use pwasm::MessageExt;
 
         messages! {
-            Add(u32, u64, u16);
+            Foo(u32, u64, u16);
             UseArray([u32; 5], Vec<bool>);
             Get() -> usize;
             OneArg(u64);
         }
 
         assert_eq!(
-            Add::signature().into_iter().collect::<String>(),
-            "Add(uint32,uint64,uint16)"
+            Foo::signature().into_iter().collect::<String>(),
+            "Foo(uint32,uint64,uint16)"
         );
         assert_eq!(
-            UseArray::signature()
-                .into_iter()
-                .collect::<String>(),
+            UseArray::signature().into_iter().collect::<String>(),
             "UseArray(uint32[5],bool[])"
         );
-        assert_eq!(
-            Get::signature().into_iter().collect::<String>(),
-            "Get()"
-        );
+        assert_eq!(Get::signature().into_iter().collect::<String>(), "Get()");
         assert_eq!(
             OneArg::signature().into_iter().collect::<String>(),
             "OneArg(uint64)"
         );
+    }
+
+    #[test]
+    fn request() {
+        #![allow(non_camel_case_types)]
+
+        use ::pwasm::Request;
+
+        messages! {
+            foo(u32, u64, u16);
+        }
+
+        assert_eq!(Request::new::<foo>((0, 1, 2)).function_selector, [0; 4]);
     }
 }

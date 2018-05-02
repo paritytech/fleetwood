@@ -6,6 +6,8 @@ authors = ["Jef <jackefransham@gmail.com>"]
 [dependencies]
 # pwasm-ethereum = "*"
 serde = "*"
+either = "*"
+tiny-keccak = "*"
 
 [patch.crates-io]
 wee_alloc = { git = "https://github.com/rustwasm/wee_alloc.git" }
