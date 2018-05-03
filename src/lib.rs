@@ -1,11 +1,10 @@
 #![cfg_attr(not(feature = "std"), no_std)]
-#![cfg_attr(feature = "nightly", feature(overlapping_marker_traits))]
-#![feature(never_type)]
+#![feature(never_type, const_fn, specialization, overlapping_marker_traits)]
 #![allow(dead_code)]
 
-extern crate serde;
-extern crate either;
 extern crate core;
+extern crate either;
+extern crate serde;
 extern crate tiny_keccak;
 
 pub mod shim {
@@ -13,7 +12,7 @@ pub mod shim {
     pub struct H256(());
 
     impl U256 {
-        pub fn new() -> Self {
+        pub const fn new() -> Self {
             U256(())
         }
     }
@@ -76,46 +75,168 @@ mod pwasm {
         }
     }
 
+    #[derive(Debug, Copy, Clone, Default)]
     pub struct NoMethodError;
 
     pub struct TxInfo(());
+
+    impl TxInfo {
+        #[cfg(test)]
+        pub fn new() -> Self {
+            TxInfo(())
+        }
+    }
 
     pub type Result<T> = StdResult<T, NoMethodError>;
 
     pub struct Request {
         pub function_selector: [u8; 4],
+        // TODO: Work out what to do here. We don't need to optimize this by avoiding serialization costs
+        //       since the "optimized" route is for testing only.
+        pub value: Box<Any>,
+    }
+
+    fn make_selector<'a, I: IntoIterator<Item = &'a str>>(iter: I) -> [u8; 4] {
+        let mut keccak = ::tiny_keccak::Keccak::new_sha3_256();
+
+        for element in iter {
+            keccak.update(element.as_bytes());
+        }
+
+        let mut out = [0u8; 4];
+        keccak.finalize(&mut out);
+        out
     }
 
     // For testing
     impl Request {
-        pub fn new<M: Message>(_input: M::Input) -> Self {
-            let mut keccak = ::tiny_keccak::Keccak::new_sha3_256();
-            for element in M::signature() {
-                keccak.update(element.as_bytes());
-            }
-            let mut out = [0u8; 4];
-            keccak.finalize(&mut out);
+        pub fn new<M: Message>(input: M::Input) -> Self
+        // TODO
+        where
+            M::Input: 'static
+        {
+            let sel = M::selector();
 
             Request {
-                function_selector: out,
+                function_selector: sel,
+                value: Box::new(input),
             }
         }
     }
 
-    pub trait Response<To: Message> {
-        fn to(data: To::Output) -> Self;
+    pub trait Response {
+        fn output_for<M: Message>(self) -> Option<M::Output>
+        where
+            M::Output: Any;
     }
 
-    pub fn deploy_data() -> DeployData {
+    use std::any::Any;
+
+    impl<Head: Any, Rest> Response for Either<Head, Rest>
+    where
+        Rest: Response,
+    {
+        fn output_for<M: Message>(self) -> Option<M::Output>
+        where
+            M::Output: Any,
+        {
+            use std::{mem, ptr};
+            use std::any::TypeId;
+
+            match self {
+                Either::Left(left) => if TypeId::of::<Head>() == TypeId::of::<M::Output>() {
+                    let out = unsafe { ptr::read(&left as *const Head as *const M::Output) };
+
+                    mem::forget(left);
+
+                    Some(out)
+                } else {
+                    None
+                },
+                Either::Right(right) => right.output_for::<M>(),
+            }
+        }
+    }
+
+    impl Response for ! {
+        fn output_for<M: Message>(self) -> Option<M::Output>
+        where
+            M::Output: Any,
+        {
+            None
+        }
+    }
+
+    // TODO: Should we build on deployment or should there be a "deploy" step? Building on deployment is _way_
+    //       simpler.
+    pub const fn deploy_data() -> DeployData {
         DeployData {
             deployer: U256::new(),
         }
     }
 
-    pub trait ContractDef<State> {
-        type Output;
+    pub struct ContractInstance<'a, S, T: 'a> {
+        env: &'a EthEnv,
+        state: S,
+        contract: &'a T,
+    }
 
-        fn handle_message(self, state: &mut State, input: Request) -> Self::Output;
+    impl<'a, S, T> ContractInstance<'a, S, T>
+    where
+        T: ContractDef<S>,
+        T::Output: Response,
+    {
+        pub fn call<M: Message>(&mut self, input: M::Input) -> Option<M::Output>
+        where
+            T: RespondsTo<M>,
+            M::Output: 'static,
+            // TODO
+            M::Input: 'static
+        {
+            Response::output_for::<M>(self.contract.send_request(
+                self.env,
+                &mut self.state,
+                Request::new::<M>(input),
+            ))
+        }
+    }
+
+    pub trait ContractDef<State> {
+        type Output: Response + 'static;
+
+        // We have this function to allow easy testing for users. For a lot of functions they don't need
+        // to deploy to the blockchain at all.
+        fn send_request(&self, _env: &EthEnv, state: &mut State, input: Request) -> Self::Output;
+
+        fn construct(&self, txdata: TxInfo) -> State;
+
+        fn deploy<'a>(&'a self, env: &'a EthEnv, txdata: TxInfo) -> ContractInstance<'a, State, Self>
+        where
+            Self: Sized,
+        {
+            let state = self.construct(txdata);
+            ContractInstance {
+                env,
+                state,
+                contract: self,
+            }
+        }
+
+        fn call<M: Message>(
+            &self,
+            env: &EthEnv,
+            state: &mut State,
+            input: M::Input,
+        ) -> Option<M::Output>
+        where
+            Self::Output: Response,
+            Self: Sized,
+            M::Output: 'static,
+            // TODO
+            M::Input: 'static,
+        {
+            Response::output_for::<M>(self.send_request(env, state, Request::new::<M>(input)))
+        }
     }
 
     impl<C, H> ContractDef<C::Output> for Contract<C, H>
@@ -125,8 +246,17 @@ mod pwasm {
     {
         type Output = H::Output;
 
-        fn handle_message(self, _state: &mut C::Output, _input: Request) -> Self::Output {
-            unimplemented!()
+        fn construct(&self, txdata: TxInfo) -> C::Output {
+            self.constructor.call(txdata)
+        }
+
+        fn send_request(
+            &self,
+            env: &EthEnv,
+            state: &mut C::Output,
+            input: Request,
+        ) -> Self::Output {
+            self.handlers.handle(env, state, input).expect("No method")
         }
     }
 
@@ -143,8 +273,7 @@ mod pwasm {
     pub struct WriteState;
 
     impl<S> StateWriter<S> for NoWriteState {
-        fn write_state(_state: &S) {
-        }
+        fn write_state(_state: &S) {}
     }
 
     impl<S> StateWriter<S> for WriteState {
@@ -183,9 +312,10 @@ mod pwasm {
     }
 
     pub trait Handlers<State> {
-        type Output;
+        type Output: Response + 'static;
 
-        fn handle(self, env: &EthEnv, state: State, name: &str, msg_data: &[u8]) -> Result<()>;
+        fn handle(&self, env: &EthEnv, state: &mut State, request: Request)
+            -> Result<Self::Output>;
     }
 
     use either::Either;
@@ -195,24 +325,26 @@ mod pwasm {
     impl<M, Rest, $statename, SW> Handlers<$statename> for ((PhantomData<M>, MessageHandler<for<'a> fn(&'a EthEnv, &'a $($any)*, M::Input) -> M::Output, SW>), Rest)
     where
         M: Message,
+        <M as Message>::Input: 'static,
+        <M as Message>::Output: 'static,
         Rest: Handlers<$statename>,
         SW: StateWriter<$statename>,
     {
         type Output = Either<<M as Message>::Output, <Rest as Handlers<$statename>>::Output>;
 
         // TODO: Pre-hash?
-        fn handle(self, env: &EthEnv, mut state: $statename, name: &str, msg_data: &[u8]) -> Result<()> {
-            fn deserialize<In, Out>(_: In) -> Out {
-                unimplemented!()
+        fn handle(&self, env: &EthEnv, state: &mut $statename, request: Request) -> Result<Self::Output> {
+            fn deserialize<Out>(req: Request) -> Out where Out: 'static {
+                *req.value.downcast::<Out>().unwrap()
             }
 
-            if M::NAME == name {
+            if M::selector() == request.function_selector {
                 let head = self.0;
-                (head.1.handler)(env, &mut state, deserialize(msg_data));
+                let out = (head.1.handler)(env, state, deserialize(request));
                 SW::write_state(&state);
-                Ok(())
+                Ok(Either::Left(out))
             } else {
-                self.1.handle(env, state, name, msg_data)
+                self.1.handle(env, state, request).map(Either::Right)
             }
         }
     }
@@ -225,7 +357,12 @@ mod pwasm {
     impl<State> Handlers<State> for () {
         type Output = !;
 
-        fn handle(self, _env: &EthEnv, _state: State, _name: &str, _msg_data: &[u8]) -> Result<()> {
+        fn handle(
+            &self,
+            _env: &EthEnv,
+            _state: &mut State,
+            _request: Request,
+        ) -> Result<Self::Output> {
             Err(NoMethodError)
         }
     }
@@ -395,8 +532,8 @@ mod pwasm {
         type Iter: IntoIterator<Item = &'static str>;
         fn signature() -> Self::Iter;
 
-        fn selector() -> u32 {
-            unimplemented!()
+        fn selector() -> [u8; 4] {
+            make_selector(Self::signature())
         }
     }
 
@@ -415,28 +552,29 @@ mod pwasm {
         }
     }
 
-    pub struct TxData(());
-
-    #[cfg(feature = "nightly")]
     pub trait RespondsTo<T> {}
 
-    #[cfg(feature = "nightly")]
     impl<C, Msg, Handler, Rest> RespondsTo<Msg> for Contract<C, ((PhantomData<Msg>, Handler), Rest)> {}
-    #[cfg(feature = "nightly")]
     impl<C, Msg, Head, Rest> RespondsTo<Msg> for Contract<C, (Head, Rest)>
     where
         Contract<C, Rest>: RespondsTo<Msg>,
     {
     }
 
-    // This is essentially a hack to get around the fact that `FnOnce::Output` is
+    // This is essentially a hack to get around the fact that `FnOnce`'s internals are
     // unstable
     pub trait Constructor {
         type Output;
+
+        fn call(&self, txinfo: TxInfo) -> Self::Output;
     }
 
     impl<Out> Constructor for fn(TxInfo) -> Out {
         type Output = Out;
+
+        fn call(&self, txinfo: TxInfo) -> Self::Output {
+            self(txinfo)
+        }
     }
 
     pub struct Contract<Constructor, Handle> {
@@ -445,7 +583,7 @@ mod pwasm {
     }
 
     impl Contract<(), ()> {
-        pub fn new() -> Self {
+        pub const fn new() -> Self {
             Contract {
                 constructor: (),
                 handlers: (),
@@ -462,7 +600,7 @@ mod pwasm {
         // since that's a footgun (it'll work if the state and init are the same
         // type but not otherwise).
 
-        pub fn constructor<Out>(
+        pub const fn constructor<Out>(
             self,
             constructor: fn(TxInfo) -> Out,
         ) -> Contract<fn(TxInfo) -> Out, ()> {
@@ -479,10 +617,7 @@ mod pwasm {
         for<'a> fn(&'a EthEnv, &'a mut St, <M as Message>::Input) -> <M as Message>::Output;
 
     impl<Cons: Constructor + Copy, Handle: Handlers<Cons::Output> + Copy> Contract<Cons, Handle> {
-        // We can't make this return an `impl Trait`-style result because it would require
-        // HKT.
-
-        fn with_handler<M, H, SW>(
+        const fn with_handler<M, H, SW>(
             self,
             handler: H,
         ) -> Contract<Cons, ((PhantomData<M>, MessageHandler<H, SW>), Handle)> {
@@ -501,7 +636,7 @@ mod pwasm {
             }
         }
 
-        pub fn on_msg<M>(
+        pub const fn on_msg<M>(
             self,
             handler: Handler<M, Cons::Output>,
         ) -> Contract<
@@ -520,7 +655,7 @@ mod pwasm {
             self.with_handler(handler)
         }
 
-        pub fn on_msg_mut<M>(
+        pub const fn on_msg_mut<M>(
             self,
             handler: HandlerMut<M, Cons::Output>,
         ) -> Contract<
@@ -580,6 +715,13 @@ mod pwasm {
     }
 
     pub struct EthEnv(());
+
+    impl EthEnv {
+        #[cfg(test)]
+        pub fn new() -> Self {
+            EthEnv(())
+        }
+    }
 
     pub trait RemoteContract {}
 
@@ -715,7 +857,7 @@ macro_rules! messages {
 }
 
 mod example {
-    use pwasm::{self, Contract, ContractDef};
+    use pwasm::{Contract, ContractDef};
 
     messages! {
         Add(u32);
@@ -727,9 +869,7 @@ mod example {
         calls_to_add: usize,
     }
 
-    pub fn contract() -> impl ContractDef<State> {
-        let _deploy_info: ::pwasm::DeployData = pwasm::deploy_data();
-
+    pub const fn contract() -> impl ContractDef<State> {
         Contract::new()
             .constructor(|_txdata| State {
                 current: 1u32,
@@ -785,12 +925,54 @@ mod test {
     fn request() {
         #![allow(non_camel_case_types)]
 
-        use ::pwasm::Request;
+        use pwasm::Request;
 
         messages! {
             foo(u32, u64, u16);
         }
 
-        assert_eq!(Request::new::<foo>((0, 1, 2)).function_selector, [0; 4]);
+        let request = Request::new::<foo>((0, 1, 2));
+        // assert_eq!(request.function_selector, [0; 4]);
+    }
+
+    #[test]
+    fn contract() {
+        use pwasm::{Contract, ContractDef, EthEnv, TxInfo};
+
+        messages! {
+            Add(u32);
+            Get() -> u32;
+            Unused();
+        }
+
+        pub struct State {
+            current: u32,
+            calls_to_add: usize,
+        }
+
+        // TODO: I don't know how this will work
+        let env = EthEnv::new();
+
+        let definition = Contract::new()
+            .constructor(|_txdata| State {
+                current: 1u32,
+                calls_to_add: 0usize,
+            })
+            .on_msg_mut::<Add>(|_env, state, to_add| {
+                state.calls_to_add += 1;
+                state.current += to_add;
+            })
+            .on_msg::<Get>(|_env, state, ()| state.current);
+
+        // `TxInfo` is the information on the existing transaction
+        let mut contract = definition.deploy(&env, TxInfo::new());
+
+        let out: () = contract.call::<Add>(1).unwrap();
+        let val: u32 = contract.call::<Get>(()).unwrap();
+
+        // Doesn't compile
+        // contract.call::<Unused>(()).unwrap();
+
+        assert_eq!(val, 2);
     }
 }
