@@ -1,7 +1,13 @@
 #![cfg_attr(not(feature = "std"), no_std)]
-#![feature(never_type, const_fn, specialization, overlapping_marker_traits)]
+#![feature(never_type, const_fn, overlapping_marker_traits)]
 #![allow(dead_code)]
 
+#[macro_use]
+extern crate lazy_static;
+#[macro_use]
+extern crate serde_derive;
+
+extern crate bincode;
 extern crate core;
 extern crate either;
 extern crate serde;
@@ -37,12 +43,62 @@ pub mod shim {
         unimplemented!()
     }
 
-    pub fn write_state(_len: usize, _ptr: *const u8) {
-        unimplemented!()
+    use std::sync::Mutex;
+
+    // TODO: `{read,write}_state` should be supplied by the runtime
+    lazy_static! {
+        static ref STATE_MUTEX: Mutex<Vec<u8>> = Mutex::new(Vec::new());
     }
 
-    pub fn read_state(_len: usize, _ptr: *mut u8) {
-        unimplemented!()
+    // This is essentially writing `T`'s bytes to a static location in the contract's state and
+    // so is vulnerable to type confusion and other nasty bugs. Our API makes it safe by
+    // enforcing essentially a state machine where only one type is valid in this location at
+    // any given time.
+    //
+    // This should be an inbuilt fn from the runtime but this is a shim.
+    //
+    // It corresponds essentially to the Rust `Write::write` fn. The `at`
+    // parameter allows you to incrementally write (allowing allocationless
+    // writing).
+    //
+    // TODO: Should we use u64?
+    pub unsafe fn write_state(at: usize, size: usize, pointer: *const u8) -> usize {
+        use std::slice;
+        let mut vec = STATE_MUTEX.lock().unwrap();
+
+        let s = slice::from_raw_parts(pointer, size);
+        let overlap = vec.len() - at;
+        if at < vec.len() {
+            let out_slice = &mut vec[overlap..];
+            out_slice.copy_from_slice(&s[..overlap]);
+        }
+
+        assert!(at <= vec.len());
+
+        let slice = &s[overlap..];
+
+        vec.extend(slice);
+
+        size
+    }
+
+    // This should be an inbuilt fn from the runtime but this is a shim
+    //
+    // It corresponds essentially to the Rust `Read::read` fn. The `at`
+    // parameter allows you to incrementally read (allowing allocationless
+    // reading).
+    //
+    // TODO: Should we use u64?
+    pub unsafe fn read_state(at: usize, size: usize, pointer: *mut u8) -> usize {
+        use std::slice;
+        let slice = slice::from_raw_parts_mut(pointer, size);
+        let vec = STATE_MUTEX.lock().unwrap();
+
+        let length = (vec.len() - at).min(size);
+
+        slice[..length].copy_from_slice(&vec[at..at + length]);
+
+        length
     }
 }
 
@@ -53,10 +109,46 @@ mod pwasm {
     use core::iter;
     use core::marker::PhantomData;
     use core::result::Result as StdResult;
+    use std::io;
 
-    use pwasm_ethereum::{self, *};
+    use pwasm_ethereum::*;
 
     use serde::{Deserialize, Serialize};
+
+    // TODO: Should we lock a mutex here? It won't be exposed to the contract writer
+    pub struct EthState {
+        at: usize,
+    }
+
+    impl EthState {
+        fn new() -> Self {
+            EthState { at: 0 }
+        }
+    }
+
+    impl io::Write for EthState {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let out = unsafe { ::pwasm_ethereum::write_state(self.at, buf.len(), buf.as_ptr()) };
+
+            self.at += out;
+
+            Ok(out)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl io::Read for EthState {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let out = unsafe { ::pwasm_ethereum::read_state(self.at, buf.len(), buf.as_mut_ptr()) };
+
+            self.at += out;
+
+            Ok(out)
+        }
+    }
 
     // Replacement for `HashMap` that doesn't require serializing/deserializing the
     // full map every time you attempt to run a handler.
@@ -93,7 +185,7 @@ mod pwasm {
         pub function_selector: [u8; 4],
         // TODO: Work out what to do here. We don't need to optimize this by avoiding serialization costs
         //       since the "optimized" route is for testing only.
-        pub value: Box<Any>,
+        pub value: Vec<u8>,
     }
 
     fn make_selector<'a, I: IntoIterator<Item = &'a str>>(iter: I) -> [u8; 4] {
@@ -111,15 +203,14 @@ mod pwasm {
     // For testing
     impl Request {
         pub fn new<M: Message>(input: M::Input) -> Self
-        // TODO
         where
-            M::Input: 'static
+            M::Input: Serialize,
         {
             let sel = M::selector();
 
             Request {
                 function_selector: sel,
-                value: Box::new(input),
+                value: ::bincode::serialize(&input).unwrap(),
             }
         }
     }
@@ -140,8 +231,8 @@ mod pwasm {
         where
             M::Output: Any,
         {
-            use std::{mem, ptr};
             use std::any::TypeId;
+            use std::{mem, ptr};
 
             match self {
                 Either::Left(left) => if TypeId::of::<Head>() == TypeId::of::<M::Output>() {
@@ -158,7 +249,7 @@ mod pwasm {
         }
     }
 
-    impl Response for ! {
+    impl Response for Void {
         fn output_for<M: Message>(self) -> Option<M::Output>
         where
             M::Output: Any,
@@ -176,8 +267,8 @@ mod pwasm {
     }
 
     pub struct ContractInstance<'a, S, T: 'a> {
-        env: &'a EthEnv,
-        state: S,
+        pub env: &'a EthEnv,
+        pub state: S,
         contract: &'a T,
     }
 
@@ -186,18 +277,18 @@ mod pwasm {
         T: ContractDef<S>,
         T::Output: Response,
     {
-        pub fn call<M: Message>(&mut self, input: M::Input) -> Option<M::Output>
+        pub fn call<M: Message>(&mut self, input: M::Input) -> M::Output
         where
             T: RespondsTo<M>,
-            M::Output: 'static,
             // TODO
-            M::Input: 'static
+            M::Output: 'static,
+            M::Input: Serialize + for<'any> Deserialize<'any>,
         {
             Response::output_for::<M>(self.contract.send_request(
                 self.env,
                 &mut self.state,
                 Request::new::<M>(input),
-            ))
+            )).expect("RespondsTo was implemented but we couldn't get the output")
         }
     }
 
@@ -210,7 +301,11 @@ mod pwasm {
 
         fn construct(&self, txdata: TxInfo) -> State;
 
-        fn deploy<'a>(&'a self, env: &'a EthEnv, txdata: TxInfo) -> ContractInstance<'a, State, Self>
+        fn deploy<'a>(
+            &'a self,
+            env: &'a EthEnv,
+            txdata: TxInfo,
+        ) -> ContractInstance<'a, State, Self>
         where
             Self: Sized,
         {
@@ -232,8 +327,7 @@ mod pwasm {
             Self::Output: Response,
             Self: Sized,
             M::Output: 'static,
-            // TODO
-            M::Input: 'static,
+            M::Input: Serialize,
         {
             Response::output_for::<M>(self.send_request(env, state, Request::new::<M>(input)))
         }
@@ -276,7 +370,7 @@ mod pwasm {
         fn write_state(_state: &S) {}
     }
 
-    impl<S> StateWriter<S> for WriteState {
+    impl<S: Serialize> StateWriter<S> for WriteState {
         fn write_state(state: &S) {
             write_state_generic(state)
         }
@@ -322,40 +416,51 @@ mod pwasm {
 
     macro_rules! impl_handlers {
         ($statename:ident, $($any:tt)*) => {
-    impl<M, Rest, $statename, SW> Handlers<$statename> for ((PhantomData<M>, MessageHandler<for<'a> fn(&'a EthEnv, &'a $($any)*, M::Input) -> M::Output, SW>), Rest)
-    where
-        M: Message,
-        <M as Message>::Input: 'static,
-        <M as Message>::Output: 'static,
-        Rest: Handlers<$statename>,
-        SW: StateWriter<$statename>,
-    {
-        type Output = Either<<M as Message>::Output, <Rest as Handlers<$statename>>::Output>;
+            impl<M, Rest, $statename, SW> Handlers<$statename> for (
+                (
+                    PhantomData<M>,
+                    MessageHandler<
+                        for<'a> fn(&'a EthEnv, &'a $($any)*, M::Input) -> M::Output,
+                        SW
+                    >,
+                ),
+                Rest
+            )
+            where
+                M: Message,
+                <M as Message>::Input: for<'a> Deserialize<'a>,
+                <M as Message>::Output: 'static,
+                Rest: Handlers<$statename>,
+                SW: StateWriter<$statename>,
+            {
+                type Output = Either<<M as Message>::Output, <Rest as Handlers<$statename>>::Output>;
 
-        // TODO: Pre-hash?
-        fn handle(&self, env: &EthEnv, state: &mut $statename, request: Request) -> Result<Self::Output> {
-            fn deserialize<Out>(req: Request) -> Out where Out: 'static {
-                *req.value.downcast::<Out>().unwrap()
-            }
+                // TODO: Pre-hash?
+                fn handle(&self, env: &EthEnv, state: &mut $statename, request: Request) -> Result<Self::Output> {
+                    fn deserialize<Out: for<'a> Deserialize<'a>>(req: Request) -> Out {
+                        ::bincode::deserialize(&req.value).unwrap()
+                    }
 
-            if M::selector() == request.function_selector {
-                let head = self.0;
-                let out = (head.1.handler)(env, state, deserialize(request));
-                SW::write_state(&state);
-                Ok(Either::Left(out))
-            } else {
-                self.1.handle(env, state, request).map(Either::Right)
+                    if M::selector() == request.function_selector {
+                        let head = self.0;
+                        let out = (head.1.handler)(env, state, deserialize(request));
+                        SW::write_state(&state);
+                        Ok(Either::Left(out))
+                    } else {
+                        self.1.handle(env, state, request).map(Either::Right)
+                    }
+                }
             }
-        }
-    }
         }
     }
 
     impl_handlers!(State, State);
     impl_handlers!(State, mut State);
 
+    pub enum Void {}
+
     impl<State> Handlers<State> for () {
-        type Output = !;
+        type Output = Void;
 
         fn handle(
             &self,
@@ -367,8 +472,8 @@ mod pwasm {
         }
     }
 
-    fn write_state_generic<T>(val: &T) {
-        unsafe { write_state(::core::mem::size_of::<T>(), val as *const T as *const u8) };
+    fn write_state_generic<T: Serialize>(val: &T) {
+        ::bincode::serialize_into(EthState::new(), val).unwrap();
     }
 
     pub trait ArgSignature {
@@ -427,7 +532,29 @@ mod pwasm {
     }
 
     sol_array!(
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 32, 64, 128, 256, 512, 1024
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024
     );
 
     impl<T> SolidityType for Vec<T>
@@ -603,7 +730,10 @@ mod pwasm {
         pub const fn constructor<Out>(
             self,
             constructor: fn(TxInfo) -> Out,
-        ) -> Contract<fn(TxInfo) -> Out, ()> {
+        ) -> Contract<fn(TxInfo) -> Out, ()>
+        where
+            Out: Serialize,
+        {
             Contract {
                 constructor: constructor,
                 handlers: self.handlers,
@@ -616,7 +746,12 @@ mod pwasm {
     type HandlerMut<M, St> =
         for<'a> fn(&'a EthEnv, &'a mut St, <M as Message>::Input) -> <M as Message>::Output;
 
-    impl<Cons: Constructor + Copy, Handle: Handlers<Cons::Output> + Copy> Contract<Cons, Handle> {
+    impl<Cons, Handle> Contract<Cons, Handle>
+    where
+        Cons: Constructor + Copy,
+        Handle: Handlers<Cons::Output> + Copy,
+        Cons::Output: Serialize,
+    {
         const fn with_handler<M, H, SW>(
             self,
             handler: H,
@@ -778,63 +913,6 @@ mod pwasm {
         fn call(&self, method: &[u8], args: &[u8]) -> &[u8];
     }
 
-    // This is essentially writing `T`'s bytes to a static location in the contract's state and
-    // so is vulnerable to type confusion and other nasty bugs. Our API makes it safe by
-    // enforcing essentially a state machine where only one type is valid in this location at
-    // any given time.
-    //
-    // This should be an inbuilt fn from the runtime but this is a shim
-    unsafe fn write_state(size: usize, pointer: *const u8) {
-        use core::ptr;
-        use pwasm_ethereum::{H256, U256};
-
-        const STEP_SIZE: usize = 32;
-
-        // TODO: uninit
-        let mut buffer = [0; STEP_SIZE];
-
-        // We can't write more than `usize::MAX` bytes anyway since our
-        // state is a Rust struct.
-        for i in 0..size / STEP_SIZE {
-            let key = H256::from(U256::from(i));
-
-            let offset = i * STEP_SIZE;
-            let remaining = size - offset;
-
-            ptr::copy_nonoverlapping(
-                pointer.offset(offset as isize),
-                buffer.as_mut_ptr(),
-                STEP_SIZE.min(remaining),
-            );
-
-            pwasm_ethereum::write(&key, &buffer);
-        }
-    }
-
-    // This should be an inbuilt fn from the runtime but this is a shim
-    unsafe fn read_state(size: usize, pointer: *mut u8) {
-        use core::ptr;
-        use pwasm_ethereum::{H256, U256};
-
-        const STEP_SIZE: usize = 32;
-
-        // We can't write more than `usize::MAX` bytes anyway since our
-        // state is a Rust struct.
-        for i in 0..size / STEP_SIZE {
-            let key = H256::from(U256::from(i));
-
-            let offset = i * STEP_SIZE;
-            let remaining = size - offset;
-
-            let buffer = pwasm_ethereum::read(&key);
-
-            ptr::copy_nonoverlapping(
-                buffer.as_ptr(),
-                pointer.offset(offset as isize),
-                STEP_SIZE.min(remaining),
-            );
-        }
-    }
 }
 
 macro_rules! messages {
@@ -864,6 +942,7 @@ mod example {
         Get() -> u32;
     }
 
+    #[derive(Serialize, Deserialize)]
     pub struct State {
         current: u32,
         calls_to_add: usize,
@@ -931,7 +1010,7 @@ mod test {
             foo(u32, u64, u16);
         }
 
-        let request = Request::new::<foo>((0, 1, 2));
+        let _request = Request::new::<foo>((0, 1, 2));
         // assert_eq!(request.function_selector, [0; 4]);
     }
 
@@ -945,12 +1024,14 @@ mod test {
             Unused();
         }
 
+        #[derive(Serialize, Deserialize, Eq, PartialEq, Debug)]
         pub struct State {
             current: u32,
             calls_to_add: usize,
         }
 
-        // TODO: I don't know how this will work
+        // TODO: Probably you won't be able to create a new instance of the "proper"
+        //       `EthEnv`, only a dummy version.
         let env = EthEnv::new();
 
         let definition = Contract::new()
@@ -967,12 +1048,19 @@ mod test {
         // `TxInfo` is the information on the existing transaction
         let mut contract = definition.deploy(&env, TxInfo::new());
 
-        let out: () = contract.call::<Add>(1).unwrap();
-        let val: u32 = contract.call::<Get>(()).unwrap();
+        let _: () = contract.call::<Add>(1);
+        let val: u32 = contract.call::<Get>(());
 
         // Doesn't compile
         // contract.call::<Unused>(()).unwrap();
 
         assert_eq!(val, 2);
+        assert_eq!(
+            contract.state,
+            State {
+                current: 2,
+                calls_to_add: 1,
+            }
+        );
     }
 }

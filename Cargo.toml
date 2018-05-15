@@ -5,9 +5,12 @@ authors = ["Jef <jackefransham@gmail.com>"]
 
 [dependencies]
 # pwasm-ethereum = "*"
+lazy_static = "*"
 serde = "*"
+serde_derive = "*"
 either = "*"
 tiny-keccak = "*"
+bincode = "*"
 
 [patch.crates-io]
 wee_alloc = { git = "https://github.com/rustwasm/wee_alloc.git" }
