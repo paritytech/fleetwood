@@ -1,5 +1,4 @@
 #![cfg_attr(not(feature = "std"), no_std)]
-#![feature(never_type, const_fn, overlapping_marker_traits)]
 #![allow(dead_code)]
 
 #[macro_use]
@@ -7,146 +6,294 @@ extern crate lazy_static;
 #[macro_use]
 extern crate serde_derive;
 
+extern crate bigint;
 extern crate bincode;
 extern crate core;
 extern crate either;
+extern crate parity_hash;
 extern crate serde;
 extern crate tiny_keccak;
 
 pub mod shim {
-    pub struct U256(());
-    pub struct H256(());
-
-    impl U256 {
-        pub const fn new() -> Self {
-            U256(())
-        }
-    }
-
-    impl From<U256> for H256 {
-        fn from(_other: U256) -> Self {
-            unimplemented!()
-        }
-    }
-
-    impl From<usize> for U256 {
-        fn from(_other: usize) -> Self {
-            unimplemented!()
-        }
-    }
-
-    pub fn write(_key: &H256, _val: &[u8; 32]) {
-        unimplemented!()
-    }
-
-    pub fn read(_key: &H256) -> [u8; 32] {
-        unimplemented!()
-    }
-
+    use parity_hash::H256;
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     // TODO: `{read,write}_state` should be supplied by the runtime
     lazy_static! {
-        static ref STATE_MUTEX: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+        static ref STORAGE_MUTEX: Mutex<HashMap<[u8; 32], [u8; 32]>> = Mutex::new(HashMap::new());
     }
 
-    // This is essentially writing `T`'s bytes to a static location in the contract's state and
-    // so is vulnerable to type confusion and other nasty bugs. Our API makes it safe by
-    // enforcing essentially a state machine where only one type is valid in this location at
-    // any given time.
-    //
-    // This should be an inbuilt fn from the runtime but this is a shim.
-    //
-    // It corresponds essentially to the Rust `Write::write` fn. The `at`
-    // parameter allows you to incrementally write (allowing allocationless
-    // writing).
-    //
-    // TODO: Should we use u64?
-    pub unsafe fn write_state(at: usize, size: usize, pointer: *const u8) -> usize {
-        use std::slice;
-        let mut vec = STATE_MUTEX.lock().unwrap();
-
-        let s = slice::from_raw_parts(pointer, size);
-        let overlap = vec.len() - at;
-        if at < vec.len() {
-            let out_slice = &mut vec[overlap..];
-            out_slice.copy_from_slice(&s[..overlap]);
-        }
-
-        assert!(at <= vec.len());
-
-        let slice = &s[overlap..];
-
-        vec.extend(slice);
-
-        size
+    pub fn write(key: &H256, val: &[u8; 32]) {
+        STORAGE_MUTEX
+            .lock()
+            .unwrap()
+            .insert(key.clone().0, val.clone());
     }
 
-    // This should be an inbuilt fn from the runtime but this is a shim
-    //
-    // It corresponds essentially to the Rust `Read::read` fn. The `at`
-    // parameter allows you to incrementally read (allowing allocationless
-    // reading).
-    //
-    // TODO: Should we use u64?
-    pub unsafe fn read_state(at: usize, size: usize, pointer: *mut u8) -> usize {
-        use std::slice;
-        let slice = slice::from_raw_parts_mut(pointer, size);
-        let vec = STATE_MUTEX.lock().unwrap();
-
-        let length = (vec.len() - at).min(size);
-
-        slice[..length].copy_from_slice(&vec[at..at + length]);
-
-        length
+    pub fn read(key: &H256) -> [u8; 32] {
+        STORAGE_MUTEX
+            .lock()
+            .unwrap()
+            .get(&key.0)
+            .cloned()
+            .unwrap_or([0; 32])
     }
 }
 
 use shim as pwasm_ethereum;
 
 mod pwasm {
+    use bigint::U256;
     use core::hash::Hash;
     use core::iter;
     use core::marker::PhantomData;
     use core::result::Result as StdResult;
+    use parity_hash::H256;
     use std::io;
 
-    use pwasm_ethereum::*;
+    use pwasm_ethereum;
 
     use serde::{Deserialize, Serialize};
 
-    // TODO: Should we lock a mutex here? It won't be exposed to the contract writer
-    pub struct EthState {
-        at: usize,
-    }
+    fn increment(hash: &mut H256) {
+        let mut overflow = true;
 
-    impl EthState {
-        fn new() -> Self {
-            EthState { at: 0 }
+        loop {
+            for i in hash[..].iter_mut() {
+                if overflow {
+                    let (val, new_overflow) = i.overflowing_add(1);
+                    *i = val;
+                    overflow = new_overflow;
+                } else {
+                    return;
+                }
+            }
         }
     }
 
-    impl io::Write for EthState {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            let out = unsafe { ::pwasm_ethereum::write_state(self.at, buf.len(), buf.as_ptr()) };
+    pub mod marker {
+        pub trait BorrowMarker {
+            type Store: Default;
 
-            self.at += out;
+            fn mark_changed(_store: &Self::Store) {}
+            fn is_changed(_store: &Self::Store) -> bool {
+                false
+            }
+        }
 
-            Ok(out)
+        pub trait BorrowMut: BorrowMarker {}
+
+        pub struct Mut;
+        pub struct Immut;
+
+        impl BorrowMut for Mut {}
+
+        impl BorrowMarker for Immut {
+            type Store = ();
+        }
+
+        impl BorrowMarker for Mut {
+            type Store = ::std::cell::Cell<bool>;
+
+            fn mark_changed(store: &Self::Store) {
+                store.set(true);
+            }
+
+            fn is_changed(store: &Self::Store) -> bool {
+                store.get()
+            }
+        }
+    }
+
+    use self::marker::{BorrowMarker, BorrowMut};
+
+    pub struct Getter<Marker, T>
+    where
+        Marker: BorrowMarker,
+        T: ::serde::Serialize,
+    {
+        key: H256,
+        _marker: PhantomData<(Marker, T)>,
+        current: ::std::cell::UnsafeCell<Option<T>>,
+        changes: Marker::Store,
+    }
+
+    impl<M, T> Getter<M, T>
+    where
+        M: BorrowMarker,
+        T: for<'any> ::serde::Deserialize<'any> + ::serde::Serialize,
+    {
+        pub fn new(name: &'static str) -> Self {
+            let mut keccak = ::tiny_keccak::Keccak::new_sha3_256();
+
+            keccak.update(name.as_bytes());
+
+            let mut out = [0u8; 32];
+            keccak.finalize(&mut out);
+            Getter {
+                key: H256(out),
+                current: ::std::cell::UnsafeCell::new(None),
+                changes: Default::default(),
+                _marker: Default::default(),
+            }
+        }
+
+        unsafe fn populate(&self) {
+            if (*self.current.get()).is_none() {
+                *self.current.get() = Some(
+                    ::bincode::deserialize_from::<_, T>(EthStateReader::new(self.key.clone()))
+                        .expect("Couldn't deserialize"),
+                );
+            }
+        }
+    }
+
+    impl<M, T> Getter<M, T>
+    where
+        M: BorrowMut + BorrowMarker,
+        T: for<'any> ::serde::Deserialize<'any> + ::serde::Serialize,
+    {
+        pub fn set(&self, val: T) {
+            M::mark_changed(&self.changes);
+            unsafe { *self.current.get() = Some(val) };
+        }
+    }
+
+    impl<M, T> ::std::ops::Drop for Getter<M, T>
+    where
+        M: BorrowMarker,
+        T: ::serde::Serialize,
+    {
+        fn drop(&mut self) {
+            if M::is_changed(&self.changes) {
+                use std::io::Write;
+                let mut writer =
+                    EthStateWriter::new(::std::mem::replace(&mut self.key, Default::default()));
+                ::bincode::serialize_into(
+                    &mut writer,
+                    unsafe { &*self.current.get() }.as_ref().unwrap(),
+                ).unwrap();
+                writer.flush().unwrap();
+            }
+        }
+    }
+
+    impl<M, T> ::std::ops::Deref for Getter<M, T>
+    where
+        M: BorrowMarker,
+        T: for<'any> ::serde::Deserialize<'any> + ::serde::Serialize,
+    {
+        type Target = T;
+
+        fn deref(&self) -> &T {
+            unsafe {
+                self.populate();
+
+                Option::as_ref(&mut *self.current.get()).unwrap()
+            }
+        }
+    }
+
+    impl<M, T> ::std::ops::DerefMut for Getter<M, T>
+    where
+        M: BorrowMut + BorrowMarker,
+        T: for<'any> ::serde::Deserialize<'any> + ::serde::Serialize,
+    {
+        fn deref_mut(&mut self) -> &mut T {
+            unsafe {
+                self.populate();
+
+                M::mark_changed(&self.changes);
+
+                Option::as_mut(&mut *self.current.get()).unwrap()
+            }
+        }
+    }
+
+    struct EthStateReader {
+        key: H256,
+        val: [u8; 32],
+        index: usize,
+    }
+
+    impl EthStateReader {
+        fn new(key: H256) -> Self {
+            EthStateReader {
+                key,
+                val: pwasm_ethereum::read(&key),
+                index: 0,
+            }
+        }
+    }
+
+    impl io::Read for EthStateReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let len = buf.len();
+            let mut index = 0;
+
+            while !buf[index..].is_empty() {
+                let buf = &mut buf[index..];
+
+                let to_consume = (self.val.len() - self.index).min(buf.len());
+                buf[..to_consume].copy_from_slice(&self.val[self.index..self.index + to_consume]);
+
+                self.index += to_consume;
+                index += to_consume;
+
+                if self.index == self.val.len() {
+                    increment(&mut self.key);
+                    self.val = pwasm_ethereum::read(&self.key);
+                    self.index = 0;
+                }
+            }
+
+            Ok(len)
+        }
+    }
+
+    struct EthStateWriter {
+        key: H256,
+        val: [u8; 32],
+        index: usize,
+    }
+
+    impl EthStateWriter {
+        fn new(key: H256) -> Self {
+            EthStateWriter {
+                key,
+                val: [0; 32],
+                index: 0,
+            }
+        }
+    }
+
+    impl io::Write for EthStateWriter {
+        fn write(&mut self, mut val: &[u8]) -> io::Result<usize> {
+            let len = val.len();
+            while !val.is_empty() {
+                if self.index == self.val.len() {
+                    self.flush()?;
+                    increment(&mut self.key);
+                    self.index = 0;
+                }
+
+                let consumed = (self.val.len() - self.index).min(val.len());
+
+                self.val[self.index..self.index + consumed].copy_from_slice(&val[..consumed]);
+
+                self.index += consumed;
+
+                val = &val[consumed..];
+            }
+
+            Ok(len)
         }
 
         fn flush(&mut self) -> io::Result<()> {
+            pwasm_ethereum::write(&self.key, &self.val);
+
             Ok(())
-        }
-    }
-
-    impl io::Read for EthState {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            let out = unsafe { ::pwasm_ethereum::read_state(self.at, buf.len(), buf.as_mut_ptr()) };
-
-            self.at += out;
-
-            Ok(out)
         }
     }
 
@@ -260,9 +407,9 @@ mod pwasm {
 
     // TODO: Should we build on deployment or should there be a "deploy" step? Building on deployment is _way_
     //       simpler.
-    pub const fn deploy_data() -> DeployData {
+    pub fn deploy_data() -> DeployData {
         DeployData {
-            deployer: U256::new(),
+            deployer: U256::from(0),
         }
     }
 
@@ -274,12 +421,12 @@ mod pwasm {
 
     impl<'a, S, T> ContractInstance<'a, S, T>
     where
+        S: Default,
         T: ContractDef<S>,
         T::Output: Response,
     {
         pub fn call<M: Message>(&mut self, input: M::Input) -> M::Output
         where
-            T: RespondsTo<M>,
             // TODO
             M::Output: 'static,
             M::Input: Serialize + for<'any> Deserialize<'any>,
@@ -288,18 +435,21 @@ mod pwasm {
                 self.env,
                 &mut self.state,
                 Request::new::<M>(input),
-            )).expect("RespondsTo was implemented but we couldn't get the output")
+            )).expect("Didn't respond to message")
         }
     }
 
-    pub trait ContractDef<State> {
+    pub trait ContractDef<State>
+    where
+        State: Default,
+    {
         type Output: Response + 'static;
 
         // We have this function to allow easy testing for users. For a lot of functions they don't need
         // to deploy to the blockchain at all.
         fn send_request(&self, _env: &EthEnv, state: &mut State, input: Request) -> Self::Output;
 
-        fn construct(&self, txdata: TxInfo) -> State;
+        fn construct(&self, state: &mut State, txdata: TxInfo);
 
         fn deploy<'a>(
             &'a self,
@@ -309,7 +459,8 @@ mod pwasm {
         where
             Self: Sized,
         {
-            let state = self.construct(txdata);
+            let mut state = Default::default();
+            self.construct(&mut state, txdata);
             ContractInstance {
                 env,
                 state,
@@ -333,75 +484,20 @@ mod pwasm {
         }
     }
 
-    impl<C, H> ContractDef<C::Output> for Contract<C, H>
+    impl<C, H> ContractDef<C::State> for Contract<C, H>
     where
         C: Constructor,
-        H: Handlers<C::Output>,
+        H: Handlers<C::State>,
+        C::State: Default,
     {
         type Output = H::Output;
 
-        fn construct(&self, txdata: TxInfo) -> C::Output {
-            self.constructor.call(txdata)
+        fn construct(&self, state: &mut C::State, txdata: TxInfo) {
+            self.constructor.call(state, txdata)
         }
 
-        fn send_request(
-            &self,
-            env: &EthEnv,
-            state: &mut C::Output,
-            input: Request,
-        ) -> Self::Output {
+        fn send_request(&self, env: &EthEnv, state: &mut C::State, input: Request) -> Self::Output {
             self.handlers.handle(env, state, input).expect("No method")
-        }
-    }
-
-    pub struct MessageHandler<F, SW> {
-        handler: F,
-        write_state: PhantomData<SW>,
-    }
-
-    pub trait StateWriter<State> {
-        fn write_state(state: &State);
-    }
-
-    pub struct NoWriteState;
-    pub struct WriteState;
-
-    impl<S> StateWriter<S> for NoWriteState {
-        fn write_state(_state: &S) {}
-    }
-
-    impl<S: Serialize> StateWriter<S> for WriteState {
-        fn write_state(state: &S) {
-            write_state_generic(state)
-        }
-    }
-
-    impl<F> MessageHandler<F, NoWriteState> {
-        fn new(hnd: F) -> Self {
-            MessageHandler {
-                handler: hnd,
-                write_state: PhantomData,
-            }
-        }
-    }
-
-    impl<F> MessageHandler<F, WriteState> {
-        fn new_mut(hnd: F) -> Self {
-            MessageHandler {
-                handler: hnd,
-                write_state: PhantomData,
-            }
-        }
-    }
-
-    impl<F: Copy, S> Copy for MessageHandler<F, S> {}
-
-    impl<F: Clone, S> Clone for MessageHandler<F, S> {
-        fn clone(&self) -> Self {
-            MessageHandler {
-                handler: self.handler.clone(),
-                write_state: self.write_state,
-            }
         }
     }
 
@@ -416,13 +512,10 @@ mod pwasm {
 
     macro_rules! impl_handlers {
         ($statename:ident, $($any:tt)*) => {
-            impl<M, Rest, $statename, SW> Handlers<$statename> for (
+            impl<M, Rest, $statename> Handlers<$statename> for (
                 (
                     PhantomData<M>,
-                    MessageHandler<
-                        for<'a> fn(&'a EthEnv, &'a $($any)*, M::Input) -> M::Output,
-                        SW
-                    >,
+                    for<'a> fn(&'a EthEnv, &'a $($any)*, M::Input) -> M::Output,
                 ),
                 Rest
             )
@@ -431,7 +524,6 @@ mod pwasm {
                 <M as Message>::Input: for<'a> Deserialize<'a>,
                 <M as Message>::Output: 'static,
                 Rest: Handlers<$statename>,
-                SW: StateWriter<$statename>,
             {
                 type Output = Either<<M as Message>::Output, <Rest as Handlers<$statename>>::Output>;
 
@@ -443,8 +535,7 @@ mod pwasm {
 
                     if M::selector() == request.function_selector {
                         let head = self.0;
-                        let out = (head.1.handler)(env, state, deserialize(request));
-                        SW::write_state(&state);
+                        let out = (head.1)(env, state, deserialize(request));
                         Ok(Either::Left(out))
                     } else {
                         self.1.handle(env, state, request).map(Either::Right)
@@ -470,10 +561,6 @@ mod pwasm {
         ) -> Result<Self::Output> {
             Err(NoMethodError)
         }
-    }
-
-    fn write_state_generic<T: Serialize>(val: &T) {
-        ::bincode::serialize_into(EthState::new(), val).unwrap();
     }
 
     pub trait ArgSignature {
@@ -532,29 +619,7 @@ mod pwasm {
     }
 
     sol_array!(
-        0,
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        8,
-        9,
-        10,
-        11,
-        12,
-        13,
-        14,
-        15,
-        16,
-        32,
-        64,
-        128,
-        256,
-        512,
-        1024
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 32, 64, 128, 256, 512, 1024
     );
 
     impl<T> SolidityType for Vec<T>
@@ -679,28 +744,19 @@ mod pwasm {
         }
     }
 
-    pub trait RespondsTo<T> {}
-
-    impl<C, Msg, Handler, Rest> RespondsTo<Msg> for Contract<C, ((PhantomData<Msg>, Handler), Rest)> {}
-    impl<C, Msg, Head, Rest> RespondsTo<Msg> for Contract<C, (Head, Rest)>
-    where
-        Contract<C, Rest>: RespondsTo<Msg>,
-    {
-    }
-
     // This is essentially a hack to get around the fact that `FnOnce`'s internals are
     // unstable
     pub trait Constructor {
-        type Output;
+        type State;
 
-        fn call(&self, txinfo: TxInfo) -> Self::Output;
+        fn call(&self, state: &mut Self::State, txinfo: TxInfo);
     }
 
-    impl<Out> Constructor for fn(TxInfo) -> Out {
-        type Output = Out;
+    impl<State> Constructor for fn(&mut State, TxInfo) {
+        type State = State;
 
-        fn call(&self, txinfo: TxInfo) -> Self::Output {
-            self(txinfo)
+        fn call(&self, state: &mut Self::State, txinfo: TxInfo) {
+            self(state, txinfo)
         }
     }
 
@@ -710,7 +766,7 @@ mod pwasm {
     }
 
     impl Contract<(), ()> {
-        pub const fn new() -> Self {
+        pub fn new() -> Self {
             Contract {
                 constructor: (),
                 handlers: (),
@@ -727,12 +783,12 @@ mod pwasm {
         // since that's a footgun (it'll work if the state and init are the same
         // type but not otherwise).
 
-        pub const fn constructor<Out>(
+        pub fn constructor<State>(
             self,
-            constructor: fn(TxInfo) -> Out,
-        ) -> Contract<fn(TxInfo) -> Out, ()>
+            constructor: fn(&mut State, TxInfo),
+        ) -> Contract<fn(&mut State, TxInfo), ()>
         where
-            Out: Serialize,
+            State: Default,
         {
             Contract {
                 constructor: constructor,
@@ -749,60 +805,32 @@ mod pwasm {
     impl<Cons, Handle> Contract<Cons, Handle>
     where
         Cons: Constructor + Copy,
-        Handle: Handlers<Cons::Output> + Copy,
-        Cons::Output: Serialize,
+        Handle: Handlers<Cons::State> + Copy,
     {
-        const fn with_handler<M, H, SW>(
+        fn with_handler<M, H>(
             self,
             handler: H,
-        ) -> Contract<Cons, ((PhantomData<M>, MessageHandler<H, SW>), Handle)> {
+        ) -> Contract<Cons, ((PhantomData<M>, H), Handle)> {
             Contract {
                 constructor: self.constructor,
-                handlers: (
-                    (
-                        PhantomData,
-                        MessageHandler {
-                            handler,
-                            write_state: PhantomData,
-                        },
-                    ),
-                    self.handlers,
-                ),
+                handlers: ((PhantomData, handler), self.handlers),
             }
         }
 
-        pub const fn on_msg<M>(
+        pub fn on_msg<M>(
             self,
-            handler: Handler<M, Cons::Output>,
-        ) -> Contract<
-            Cons,
-            (
-                (
-                    PhantomData<M>,
-                    MessageHandler<Handler<M, Cons::Output>, NoWriteState>,
-                ),
-                Handle,
-            ),
-        >
+            handler: Handler<M, Cons::State>,
+        ) -> Contract<Cons, ((PhantomData<M>, Handler<M, Cons::State>), Handle)>
         where
             M: Message,
         {
             self.with_handler(handler)
         }
 
-        pub const fn on_msg_mut<M>(
+        pub fn on_msg_mut<M>(
             self,
-            handler: HandlerMut<M, Cons::Output>,
-        ) -> Contract<
-            Cons,
-            (
-                (
-                    PhantomData<M>,
-                    MessageHandler<HandlerMut<M, Cons::Output>, WriteState>,
-                ),
-                Handle,
-            ),
-        >
+            handler: HandlerMut<M, Cons::State>,
+        ) -> Contract<Cons, ((PhantomData<M>, HandlerMut<M, Cons::State>), Handle)>
         where
             M: Message,
         {
@@ -915,6 +943,46 @@ mod pwasm {
 
 }
 
+macro_rules! state {
+    (
+        struct $name:ident {
+            $(
+                $field:ident : $typ:ty
+            ),*
+            $(,)*
+        }
+    ) => {
+        pub struct $name {
+            __inner: ::std::marker::PhantomData<$name>,
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                $name {
+                    __inner: ::std::marker::PhantomData,
+                }
+            }
+        }
+
+        pub trait __State<'a>: Sized {
+            type Marker: $crate::pwasm::marker::BorrowMarker;
+            $(
+                fn $field(self) -> $crate::pwasm::Getter<Self::Marker, $typ> {
+                    $crate::pwasm::Getter::new(stringify!($field))
+                }
+            )*
+        }
+
+        impl<'a> __State<'a> for &'a mut $name {
+            type Marker = $crate::pwasm::marker::Mut;
+        }
+
+        impl<'a> __State<'a> for &'a $name {
+            type Marker = $crate::pwasm::marker::Immut;
+        }
+    };
+}
+
 macro_rules! messages {
     ($name:ident($($typ:ty),*); $($rest:tt)*) => {
         messages!($name($($typ),*) -> (); $($rest)*);
@@ -942,23 +1010,24 @@ mod example {
         Get() -> u32;
     }
 
-    #[derive(Serialize, Deserialize)]
-    pub struct State {
-        current: u32,
-        calls_to_add: usize,
+    state! {
+        struct State {
+            current: u32,
+            calls_to_add: usize,
+        }
     }
 
-    pub const fn contract() -> impl ContractDef<State> {
+    pub fn contract() -> impl ContractDef<State> {
         Contract::new()
-            .constructor(|_txdata| State {
-                current: 1u32,
-                calls_to_add: 0usize,
+            .constructor(|state: &mut State, _txdata| {
+                state.current().set(1);
+                state.calls_to_add().set(0);
             })
             .on_msg_mut::<Add>(|_env, state, to_add| {
-                state.calls_to_add += 1;
-                state.current += to_add;
+                *state.calls_to_add() += 1;
+                *state.current() += to_add;
             })
-            .on_msg::<Get>(|_env, state, ()| state.current)
+            .on_msg::<Get>(|_env, state, ()| *state.current())
     }
 }
 
@@ -1024,10 +1093,12 @@ mod test {
             Unused();
         }
 
-        #[derive(Serialize, Deserialize, Eq, PartialEq, Debug)]
-        pub struct State {
-            current: u32,
-            calls_to_add: usize,
+        state! {
+            struct State {
+                current: u32,
+                calls_to_add: usize,
+                something: Box<[u8]>,
+            }
         }
 
         // TODO: Probably you won't be able to create a new instance of the "proper"
@@ -1035,15 +1106,23 @@ mod test {
         let env = EthEnv::new();
 
         let definition = Contract::new()
-            .constructor(|_txdata| State {
-                current: 1u32,
-                calls_to_add: 0usize,
+            .constructor(|state: &mut State, _txdata| {
+                state.current().set(1);
+                state.calls_to_add().set(0);
+                state.something().set(
+                    (0..1024usize)
+                        .map(|i| i as u8)
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                );
             })
             .on_msg_mut::<Add>(|_env, state, to_add| {
-                state.calls_to_add += 1;
-                state.current += to_add;
+                *state.calls_to_add() += 1;
+                *state.current() += to_add;
             })
-            .on_msg::<Get>(|_env, state, ()| state.current);
+            .on_msg::<Get>(|_env, state, ()| {
+                *state.current()
+            });
 
         // `TxInfo` is the information on the existing transaction
         let mut contract = definition.deploy(&env, TxInfo::new());
@@ -1055,12 +1134,7 @@ mod test {
         // contract.call::<Unused>(()).unwrap();
 
         assert_eq!(val, 2);
-        assert_eq!(
-            contract.state,
-            State {
-                current: 2,
-                calls_to_add: 1,
-            }
-        );
+        assert_eq!(*contract.state.current(), 2,);
+        assert_eq!(*contract.state.calls_to_add(), 1,);
     }
 }

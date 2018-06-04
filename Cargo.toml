@@ -11,6 +11,8 @@ serde_derive = "*"
 either = "*"
 tiny-keccak = "*"
 bincode = "*"
+parity-hash = "*"
+bigint = "4.3.0"
 
 [patch.crates-io]
 wee_alloc = { git = "https://github.com/rustwasm/wee_alloc.git" }
