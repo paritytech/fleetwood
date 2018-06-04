@@ -807,10 +807,7 @@ mod pwasm {
         Cons: Constructor + Copy,
         Handle: Handlers<Cons::State> + Copy,
     {
-        fn with_handler<M, H>(
-            self,
-            handler: H,
-        ) -> Contract<Cons, ((PhantomData<M>, H), Handle)> {
+        fn with_handler<M, H>(self, handler: H) -> Contract<Cons, ((PhantomData<M>, H), Handle)> {
             Contract {
                 constructor: self.constructor,
                 handlers: ((PhantomData, handler), self.handlers),
@@ -1090,6 +1087,7 @@ mod test {
         messages! {
             Add(u32);
             Get() -> u32;
+            AssertVec();
             Unused();
         }
 
@@ -1097,7 +1095,7 @@ mod test {
             struct State {
                 current: u32,
                 calls_to_add: usize,
-                something: Box<[u8]>,
+                vec: Vec<usize>,
             }
         }
 
@@ -1109,19 +1107,20 @@ mod test {
             .constructor(|state: &mut State, _txdata| {
                 state.current().set(1);
                 state.calls_to_add().set(0);
-                state.something().set(
-                    (0..1024usize)
-                        .map(|i| i as u8)
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice(),
-                );
+                state
+                    .vec()
+                    .set((0..1024usize).collect::<Vec<_>>());
             })
             .on_msg_mut::<Add>(|_env, state, to_add| {
                 *state.calls_to_add() += 1;
                 *state.current() += to_add;
             })
-            .on_msg::<Get>(|_env, state, ()| {
-                *state.current()
+            .on_msg::<Get>(|_env, state, ()| *state.current())
+            .on_msg::<AssertVec>(|_env, state, ()| {
+                assert_eq!(
+                    *state.vec(),
+                    (0..1024usize).collect::<Vec<_>>()
+                );
             });
 
         // `TxInfo` is the information on the existing transaction
@@ -1129,6 +1128,7 @@ mod test {
 
         let _: () = contract.call::<Add>(1);
         let val: u32 = contract.call::<Get>(());
+        let _: () = contract.call::<AssertVec>(());
 
         // Doesn't compile
         // contract.call::<Unused>(()).unwrap();
