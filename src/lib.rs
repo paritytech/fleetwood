@@ -852,6 +852,7 @@ mod pwasm {
             iter::Once<&'static str>,
         >;
 
+        #[inline]
         fn arg_sig() -> Self::Iter {
             iter::once("(")
                 .chain(T::solname().into_iter())
@@ -903,6 +904,7 @@ mod pwasm {
             {
                 type Iter = tup_sig!(@chain_type $($name)*);
 
+                #[inline]
                 fn arg_sig() -> Self::Iter {
                     tup_sig!(@chain $($name)*)
                 }
@@ -1395,8 +1397,6 @@ mod test {
         // TODO: Probably you won't be able to create a new instance of the "proper"
         //       `EthEnv`, only a dummy version.
         let env = EthEnv::new();
-
-        // static BAD_TIMES_MUTEX: Mutex<pwasm::Field<pwasm::marker::Mut,
 
         let definition = Contract::new()
             .constructor(|state: &mut State, _txdata| {
