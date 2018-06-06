@@ -3,14 +3,13 @@
 
 #[macro_use]
 extern crate lazy_static;
-#[macro_use]
-extern crate serde_derive;
 
 extern crate bigint;
 extern crate bincode;
 extern crate core;
 extern crate either;
 extern crate parity_hash;
+extern crate pwasm_abi;
 extern crate serde;
 extern crate tiny_keccak;
 
@@ -19,7 +18,6 @@ pub mod shim {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    // TODO: `{read,write}_state` should be supplied by the runtime
     lazy_static! {
         static ref STORAGE_MUTEX: Mutex<HashMap<[u8; 32], [u8; 32]>> = Mutex::new(HashMap::new());
     }
@@ -50,6 +48,7 @@ mod pwasm {
     use core::marker::PhantomData;
     use core::result::Result as StdResult;
     use parity_hash::H256;
+    use pwasm_abi::eth::{Sink, Stream};
     use std::io;
 
     use pwasm_ethereum;
@@ -108,30 +107,31 @@ mod pwasm {
 
     use self::marker::{BorrowMarker, BorrowMut};
 
-    pub struct Getter<Marker, T>
+    pub struct Field<'a, Marker, T: 'a>
     where
         Marker: BorrowMarker,
         T: ::serde::Serialize,
     {
         key: H256,
-        _marker: PhantomData<(Marker, T)>,
+        _marker: PhantomData<(Marker, &'a T)>,
         current: ::std::cell::UnsafeCell<Option<T>>,
         changes: Marker::Store,
     }
 
-    impl<M, T> Getter<M, T>
+    impl<'a, M, T> Field<'a, M, T>
     where
         M: BorrowMarker,
         T: for<'any> ::serde::Deserialize<'any> + ::serde::Serialize,
     {
         pub fn new(name: &'static str) -> Self {
+            // TODO: we want to use a cheaper hashing algorithm for this.
             let mut keccak = ::tiny_keccak::Keccak::new_sha3_256();
 
             keccak.update(name.as_bytes());
 
             let mut out = [0u8; 32];
             keccak.finalize(&mut out);
-            Getter {
+            Field {
                 key: H256(out),
                 current: ::std::cell::UnsafeCell::new(None),
                 changes: Default::default(),
@@ -149,18 +149,40 @@ mod pwasm {
         }
     }
 
-    impl<M, T> Getter<M, T>
+    impl<'a, T> Field<'a, self::marker::Immut, T>
+    where
+        T: for<'any> ::serde::Deserialize<'any> + ::serde::Serialize,
+    {
+        pub fn get(name: &'static str) -> Self {
+            Self::new(name)
+        }
+    }
+
+    impl<'a, T: 'a> Field<'a, self::marker::Mut, T>
+    where
+        T: for<'any> ::serde::Deserialize<'any> + ::serde::Serialize,
+    {
+        pub fn get_mut(name: &'static str) -> Self {
+            Self::new(name)
+        }
+
+        pub fn set(name: &'static str, val: T) {
+            Self::get_mut(name).insert(val)
+        }
+    }
+
+    impl<'a, M, T> Field<'a, M, T>
     where
         M: BorrowMut + BorrowMarker,
         T: for<'any> ::serde::Deserialize<'any> + ::serde::Serialize,
     {
-        pub fn set(&self, val: T) {
+        pub fn insert(&self, val: T) {
             M::mark_changed(&self.changes);
             unsafe { *self.current.get() = Some(val) };
         }
     }
 
-    impl<M, T> ::std::ops::Drop for Getter<M, T>
+    impl<'a, M, T> ::std::ops::Drop for Field<'a, M, T>
     where
         M: BorrowMarker,
         T: ::serde::Serialize,
@@ -179,7 +201,7 @@ mod pwasm {
         }
     }
 
-    impl<M, T> ::std::ops::Deref for Getter<M, T>
+    impl<'a, M, T> ::std::ops::Deref for Field<'a, M, T>
     where
         M: BorrowMarker,
         T: for<'any> ::serde::Deserialize<'any> + ::serde::Serialize,
@@ -195,7 +217,7 @@ mod pwasm {
         }
     }
 
-    impl<M, T> ::std::ops::DerefMut for Getter<M, T>
+    impl<'a, M, T> ::std::ops::DerefMut for Field<'a, M, T>
     where
         M: BorrowMut + BorrowMarker,
         T: for<'any> ::serde::Deserialize<'any> + ::serde::Serialize,
@@ -314,29 +336,71 @@ mod pwasm {
         }
     }
 
-    #[derive(Debug, Copy, Clone, Default)]
-    pub struct NoMethodError;
+    #[derive(Debug)]
+    pub enum Error {
+        NoMethodError,
+        DecodeError(::pwasm_abi::eth::Error),
+    }
 
-    pub struct TxInfo(());
-
-    impl TxInfo {
-        #[cfg(test)]
-        pub fn new() -> Self {
-            TxInfo(())
+    impl From<::pwasm_abi::eth::Error> for Error {
+        fn from(other: ::pwasm_abi::eth::Error) -> Self {
+            Error::DecodeError(other)
         }
     }
 
-    pub type Result<T> = StdResult<T, NoMethodError>;
+    pub type Result<T> = StdResult<T, Error>;
 
     pub struct Request {
-        pub function_selector: [u8; 4],
-        // TODO: Work out what to do here. We don't need to optimize this by avoiding serialization costs
-        //       since the "optimized" route is for testing only.
-        pub value: Vec<u8>,
+        selector: [u8; 4],
+        input: Vec<u8>,
+    }
+
+    impl Request {
+        pub fn new(input: Vec<u8>) -> Option<Self> {
+            if input.len() >= 4 {
+                Some(Request {
+                    selector: [input[0], input[1], input[2], input[3]],
+                    input,
+                })
+            } else {
+                None
+            }
+        }
+
+        pub fn to_stream(&self) -> Stream {
+            Stream::new(&self.input[4..])
+        }
+
+        pub fn deserialize_input_for<M: Message>(
+            &self,
+        ) -> StdResult<M::Input, ::pwasm_abi::eth::Error> {
+            DecodeSolidityArgs::pop(&mut self.to_stream())
+        }
+
+        pub fn function_selector(&self) -> [u8; 4] {
+            [self.input[0], self.input[1], self.input[2], self.input[3]]
+        }
+
+        // For testing
+        pub fn serialize<M: Message>(input: M::Input) -> Self
+        where
+            M::Input: EncodeSolidityArgs,
+        {
+            let sel = M::selector();
+            let mut out = sel.to_vec();
+            let mut sink = Sink::new(input.count());
+            input.push(&mut sink);
+            sink.drain_to(&mut out);
+
+            Request {
+                selector: sel,
+                input: out,
+            }
+        }
     }
 
     fn make_selector<'a, I: IntoIterator<Item = &'a str>>(iter: I) -> [u8; 4] {
-        let mut keccak = ::tiny_keccak::Keccak::new_sha3_256();
+        let mut keccak = ::tiny_keccak::Keccak::new_keccak256();
 
         for element in iter {
             keccak.update(element.as_bytes());
@@ -347,20 +411,162 @@ mod pwasm {
         out
     }
 
-    // For testing
-    impl Request {
-        pub fn new<M: Message>(input: M::Input) -> Self
-        where
-            M::Input: Serialize,
-        {
-            let sel = M::selector();
-
-            Request {
-                function_selector: sel,
-                value: ::bincode::serialize(&input).unwrap(),
-            }
-        }
+    pub trait DecodeSolidityArgs: Sized {
+        fn pop(stream: &mut Stream) -> StdResult<Self, ::pwasm_abi::eth::Error>;
     }
+
+    pub trait EncodeSolidityArgs: Sized {
+        fn push(self, stream: &mut Sink);
+        fn count(&self) -> usize;
+    }
+
+    macro_rules! impl_solidityargs_abitype {
+        ($($typ:ty,)*) => {
+            $(
+                impl DecodeSolidityArgs for $typ {
+                    fn pop(stream: &mut Stream) -> StdResult<Self, ::pwasm_abi::eth::Error> {
+                        stream.pop()
+                    }
+                }
+
+                impl DecodeSolidityArgs for Vec<$typ> {
+                    fn pop(stream: &mut Stream) -> StdResult<Self, ::pwasm_abi::eth::Error> {
+                        stream.pop()
+                    }
+                }
+
+                impl EncodeSolidityArgs for $typ {
+                    fn push(self, sink: &mut Sink) {
+                        sink.push(self)
+                    }
+
+                    fn count(&self) -> usize {
+                        1
+                    }
+                }
+
+                impl EncodeSolidityArgs for Vec<$typ> {
+                    fn push(self, sink: &mut Sink) {
+                        sink.push(self)
+                    }
+
+                    fn count(&self) -> usize {
+                        self.len()
+                    }
+                }
+            )*
+        };
+    }
+
+    impl_solidityargs_abitype! {
+        Vec<u8>,
+        U256,
+        ::parity_hash::Address,
+        ::parity_hash::H256,
+        u32,
+        u64,
+        i32,
+        i64,
+        bool,
+        [u8; 1],
+        [u8; 2],
+        [u8; 3],
+        [u8; 4],
+        [u8; 5],
+        [u8; 6],
+        [u8; 7],
+        [u8; 8],
+        [u8; 9],
+        [u8; 10],
+        [u8; 11],
+        [u8; 12],
+        [u8; 13],
+        [u8; 14],
+        [u8; 15],
+        [u8; 16],
+        [u8; 17],
+        [u8; 18],
+        [u8; 19],
+        [u8; 20],
+        [u8; 21],
+        [u8; 22],
+        [u8; 23],
+        [u8; 24],
+        [u8; 25],
+        [u8; 26],
+        [u8; 27],
+        [u8; 28],
+        [u8; 29],
+        [u8; 30],
+        [u8; 31],
+        [u8; 32],
+    }
+
+    macro_rules! impl_solidityargs_tup {
+        ($first:ident $(, $rest:ident)*) => {
+            impl<$first, $($rest,)*> DecodeSolidityArgs for ($first, $($rest,)*)
+            where
+                $first: DecodeSolidityArgs,
+                $($rest : DecodeSolidityArgs,)*
+            {
+                #[allow(non_snake_case)]
+                fn pop(stream: &mut Stream) -> StdResult<Self, ::pwasm_abi::eth::Error> {
+                    let $first: $first = <$first as DecodeSolidityArgs>::pop(stream)?;
+                    $(
+                        let $rest: $rest = <$rest as DecodeSolidityArgs>::pop(stream)?;
+                    )*
+                    Ok((
+                        $first,
+                        $($rest),*
+                    ))
+                }
+            }
+
+            impl<$first, $($rest,)*> EncodeSolidityArgs for ($first, $($rest,)*)
+            where
+                $first: EncodeSolidityArgs,
+                $($rest : EncodeSolidityArgs,)*
+            {
+                #[allow(non_snake_case)]
+                fn push(self, sink: &mut Sink) {
+                    let (
+                        $first,
+                        $($rest,)*
+                    ) = self;
+                    $first.push(sink);
+                    $($rest.push(sink);)*
+                }
+
+                #[allow(non_snake_case)]
+                fn count(&self) -> usize {
+                    let $first = 1;
+                    $(
+                        let $rest = 1;
+                    )*
+
+                    $first $(+ $rest)*
+                }
+            }
+
+            impl_solidityargs_tup!($($rest),*);
+        };
+        () => {
+            impl DecodeSolidityArgs for () {
+                fn pop(_: &mut Stream) -> StdResult<Self, ::pwasm_abi::eth::Error> {
+                    Ok(())
+                }
+            }
+
+            impl EncodeSolidityArgs for () {
+                fn push(self, _: &mut Sink) { }
+                fn count(&self) -> usize {
+                    0
+                }
+            }
+        };
+    }
+
+    impl_solidityargs_tup!(A, B, C, D, E, F, G, H, I, J, K);
 
     pub trait Response {
         fn output_for<M: Message>(self) -> Option<M::Output>
@@ -422,45 +628,49 @@ mod pwasm {
     impl<'a, S, T> ContractInstance<'a, S, T>
     where
         S: Default,
-        T: ContractDef<S>,
+        T: ContractDef<State = S>,
         T::Output: Response,
     {
         pub fn call<M: Message>(&mut self, input: M::Input) -> M::Output
         where
             // TODO
             M::Output: 'static,
-            M::Input: Serialize + for<'any> Deserialize<'any>,
+            M::Input: DecodeSolidityArgs + EncodeSolidityArgs,
         {
             Response::output_for::<M>(self.contract.send_request(
                 self.env,
                 &mut self.state,
-                Request::new::<M>(input),
+                Request::serialize::<M>(input),
             )).expect("Didn't respond to message")
         }
     }
 
-    pub trait ContractDef<State>
-    where
-        State: Default,
-    {
+    pub trait ContractDef {
+        type Input;
+        type State: Default;
         type Output: Response + 'static;
 
         // We have this function to allow easy testing for users. For a lot of functions they don't need
         // to deploy to the blockchain at all.
-        fn send_request(&self, _env: &EthEnv, state: &mut State, input: Request) -> Self::Output;
+        fn send_request(
+            &self,
+            _env: &EthEnv,
+            state: &mut Self::State,
+            input: Request,
+        ) -> Self::Output;
 
-        fn construct(&self, state: &mut State, txdata: TxInfo);
+        fn construct(&self, state: &mut Self::State, input: Self::Input);
 
         fn deploy<'a>(
             &'a self,
             env: &'a EthEnv,
-            txdata: TxInfo,
-        ) -> ContractInstance<'a, State, Self>
+            input: Self::Input,
+        ) -> ContractInstance<'a, Self::State, Self>
         where
             Self: Sized,
         {
             let mut state = Default::default();
-            self.construct(&mut state, txdata);
+            self.construct(&mut state, input);
             ContractInstance {
                 env,
                 state,
@@ -471,28 +681,30 @@ mod pwasm {
         fn call<M: Message>(
             &self,
             env: &EthEnv,
-            state: &mut State,
+            state: &mut Self::State,
             input: M::Input,
         ) -> Option<M::Output>
         where
             Self::Output: Response,
             Self: Sized,
             M::Output: 'static,
-            M::Input: Serialize,
+            M::Input: EncodeSolidityArgs,
         {
-            Response::output_for::<M>(self.send_request(env, state, Request::new::<M>(input)))
+            Response::output_for::<M>(self.send_request(env, state, Request::serialize::<M>(input)))
         }
     }
 
-    impl<C, H> ContractDef<C::State> for Contract<C, H>
+    impl<C, H> ContractDef for Contract<C, H>
     where
         C: Constructor,
         H: Handlers<C::State>,
         C::State: Default,
     {
+        type State = C::State;
+        type Input = C::Input;
         type Output = H::Output;
 
-        fn construct(&self, state: &mut C::State, txdata: TxInfo) {
+        fn construct(&self, state: &mut C::State, txdata: C::Input) {
             self.constructor.call(state, txdata)
         }
 
@@ -529,13 +741,9 @@ mod pwasm {
 
                 // TODO: Pre-hash?
                 fn handle(&self, env: &EthEnv, state: &mut $statename, request: Request) -> Result<Self::Output> {
-                    fn deserialize<Out: for<'a> Deserialize<'a>>(req: Request) -> Out {
-                        ::bincode::deserialize(&req.value).unwrap()
-                    }
-
-                    if M::selector() == request.function_selector {
+                    if M::selector() == request.function_selector() {
                         let head = self.0;
-                        let out = (head.1)(env, state, deserialize(request));
+                        let out = (head.1)(env, state, request.deserialize_input_for::<M>()?);
                         Ok(Either::Left(out))
                     } else {
                         self.1.handle(env, state, request).map(Either::Right)
@@ -559,11 +767,11 @@ mod pwasm {
             _state: &mut State,
             _request: Request,
         ) -> Result<Self::Output> {
-            Err(NoMethodError)
+            Err(Error::NoMethodError)
         }
     }
 
-    pub trait ArgSignature {
+    pub trait SolidityTypeNames {
         type Iter: IntoIterator<Item = &'static str>;
         fn arg_sig() -> Self::Iter;
     }
@@ -596,6 +804,8 @@ mod pwasm {
     impl_soltype!(i16, "int16");
     impl_soltype!(i32, "int32");
     impl_soltype!(i64, "int64");
+    impl_soltype!(U256, "uint256");
+    impl_soltype!(::parity_hash::Address, "address");
 
     macro_rules! sol_array {
         (@capture $e:expr) => {
@@ -633,7 +843,7 @@ mod pwasm {
         }
     }
 
-    impl<T> ArgSignature for T
+    impl<T> SolidityTypeNames for T
     where
         T: SolidityType,
     {
@@ -685,7 +895,7 @@ mod pwasm {
             iter::once("(").chain(tup_sig!(@chain_inner $($name)+)).chain(iter::once(")"));
         };
         ($($name:ident),*) => {
-            impl<$($name),*> ArgSignature for ($($name,)*)
+            impl<$($name),*> SolidityTypeNames for ($($name,)*)
             where
             $(
                 $name : SolidityType,
@@ -710,11 +920,12 @@ mod pwasm {
         };
     }
 
+    // Any more than this and it becomes extremely slow to compile
     tup_sigs!(A B C D E F G H I J K L M N O P Q);
 
     pub trait Message {
-        type Input: for<'a> Deserialize<'a> + ArgSignature;
-        type Output: Serialize;
+        type Input: DecodeSolidityArgs + SolidityTypeNames;
+        type Output: EncodeSolidityArgs;
 
         // TODO: Pre-hash?
         const NAME: &'static str;
@@ -732,11 +943,11 @@ mod pwasm {
     impl<T> MessageExt for T
     where
         T: Message,
-        T::Input: ArgSignature,
+        T::Input: SolidityTypeNames,
     {
         type Iter = iter::Chain<
             iter::Once<&'static str>,
-            <<T::Input as ArgSignature>::Iter as IntoIterator>::IntoIter,
+            <<T::Input as SolidityTypeNames>::Iter as IntoIterator>::IntoIter,
         >;
 
         fn signature() -> Self::Iter {
@@ -748,15 +959,26 @@ mod pwasm {
     // unstable
     pub trait Constructor {
         type State;
+        type Input;
 
-        fn call(&self, state: &mut Self::State, txinfo: TxInfo);
+        fn call(&self, state: &mut Self::State, txinfo: Self::Input);
     }
 
-    impl<State> Constructor for fn(&mut State, TxInfo) {
+    impl<State, I> Constructor for fn(&mut State, I) {
         type State = State;
+        type Input = I;
 
-        fn call(&self, state: &mut Self::State, txinfo: TxInfo) {
+        fn call(&self, state: &mut Self::State, txinfo: I) {
             self(state, txinfo)
+        }
+    }
+
+    impl<State> Constructor for fn(&mut State) {
+        type State = State;
+        type Input = ();
+
+        fn call(&self, state: &mut Self::State, _: ()) {
+            self(state)
         }
     }
 
@@ -783,10 +1005,11 @@ mod pwasm {
         // since that's a footgun (it'll work if the state and init are the same
         // type but not otherwise).
 
-        pub fn constructor<State>(
+        #[inline(always)]
+        pub fn constructor<State, Input>(
             self,
-            constructor: fn(&mut State, TxInfo),
-        ) -> Contract<fn(&mut State, TxInfo), ()>
+            constructor: fn(&mut State, Input),
+        ) -> Contract<fn(&mut State, Input), ()>
         where
             State: Default,
         {
@@ -807,6 +1030,7 @@ mod pwasm {
         Cons: Constructor + Copy,
         Handle: Handlers<Cons::State> + Copy,
     {
+        #[inline(always)]
         fn with_handler<M, H>(self, handler: H) -> Contract<Cons, ((PhantomData<M>, H), Handle)> {
             Contract {
                 constructor: self.constructor,
@@ -814,6 +1038,7 @@ mod pwasm {
             }
         }
 
+        #[inline(always)]
         pub fn on_msg<M>(
             self,
             handler: Handler<M, Cons::State>,
@@ -824,6 +1049,7 @@ mod pwasm {
             self.with_handler(handler)
         }
 
+        #[inline(always)]
         pub fn on_msg_mut<M>(
             self,
             handler: HandlerMut<M, Cons::State>,
@@ -949,10 +1175,46 @@ macro_rules! state {
             $(,)*
         }
     ) => {
+        struct $name {
+            __inner: ::std::marker::PhantomData<$name>,
+        }
+
+        state! {
+            @impl $name {
+                $(
+                    $field : $typ
+                ),*
+            }
+        }
+    };
+    (
+        pub struct $name:ident {
+            $(
+                $field:ident : $typ:ty
+            ),*
+            $(,)*
+        }
+    ) => {
         pub struct $name {
             __inner: ::std::marker::PhantomData<$name>,
         }
 
+        state! {
+            @impl $name {
+                $(
+                    $field : $typ
+                ),*
+            }
+        }
+    };
+    (
+        @impl $name:ident {
+            $(
+                $field:ident : $typ:ty
+            ),*
+            $(,)*
+        }
+    ) => {
         impl Default for $name {
             fn default() -> Self {
                 $name {
@@ -964,8 +1226,8 @@ macro_rules! state {
         pub trait __State<'a>: Sized {
             type Marker: $crate::pwasm::marker::BorrowMarker;
             $(
-                fn $field(self) -> $crate::pwasm::Getter<Self::Marker, $typ> {
-                    $crate::pwasm::Getter::new(stringify!($field))
+                fn $field(self) -> $crate::pwasm::Field<'a, Self::Marker, $typ> {
+                    $crate::pwasm::Field::new(stringify!($field))
                 }
             )*
         }
@@ -1008,17 +1270,17 @@ mod example {
     }
 
     state! {
-        struct State {
+        pub struct State {
             current: u32,
             calls_to_add: usize,
         }
     }
 
-    pub fn contract() -> impl ContractDef<State> {
+    pub fn contract() -> impl ContractDef {
         Contract::new()
-            .constructor(|state: &mut State, _txdata| {
-                state.current().set(1);
-                state.calls_to_add().set(0);
+            .constructor(|state: &mut State, ()| {
+                state.current().insert(1);
+                state.calls_to_add().insert(0);
             })
             .on_msg_mut::<Add>(|_env, state, to_add| {
                 *state.calls_to_add() += 1;
@@ -1032,11 +1294,11 @@ mod example {
 mod test {
     #[test]
     fn tuple_sigs() {
-        use pwasm::ArgSignature;
+        use pwasm::SolidityTypeNames;
 
         assert_eq!(
-            <(u8, u16, u32)>::arg_sig().collect::<String>(),
-            "(uint8,uint16,uint32)"
+            <(u8, i32, u32)>::arg_sig().collect::<String>(),
+            "(uint8,int32,uint32)"
         );
     }
 
@@ -1045,19 +1307,19 @@ mod test {
         use pwasm::MessageExt;
 
         messages! {
-            Foo(u32, u64, u16);
-            UseArray([u32; 5], Vec<bool>);
-            Get() -> usize;
+            Foo(u32, u64, i32);
+            UseArray(Vec<u32>, Vec<bool>);
+            Get() -> u32;
             OneArg(u64);
         }
 
         assert_eq!(
             Foo::signature().into_iter().collect::<String>(),
-            "Foo(uint32,uint64,uint16)"
+            "Foo(uint32,uint64,int32)"
         );
         assert_eq!(
             UseArray::signature().into_iter().collect::<String>(),
-            "UseArray(uint32[5],bool[])"
+            "UseArray(uint32[],bool[])"
         );
         assert_eq!(Get::signature().into_iter().collect::<String>(), "Get()");
         assert_eq!(
@@ -1067,26 +1329,57 @@ mod test {
     }
 
     #[test]
+    fn real_world_message_sigs() {
+        #![allow(non_camel_case_types)]
+
+        use ::pwasm::MessageExt;
+
+        fn to_byte_array(i: u32) -> [u8; 4] {
+            [
+                (i >> 24) as u8,
+                (i >> 16) as u8,
+                (i >> 8) as u8,
+                i as u8,
+            ]
+        }
+
+        use bigint::U256;
+        use parity_hash::Address;
+
+        messages! {
+            totalSupply() -> U256;
+            balanceOf(Address) -> U256;
+            transfer(Address, U256) -> bool;
+        }
+
+        // These are from the expanded form of the example ERC20 token contract
+        // from step 5 of the pwasm tutorial
+        assert_eq!(totalSupply::selector(), to_byte_array(404098525u32));
+        assert_eq!(balanceOf::selector(), to_byte_array(1889567281u32));
+        assert_eq!(transfer::selector(), to_byte_array(2835717307u32));
+    }
+
+    #[test]
     fn request() {
         #![allow(non_camel_case_types)]
 
         use pwasm::Request;
 
         messages! {
-            foo(u32, u64, u16);
+            foo(u32, u64, i32);
         }
 
-        let _request = Request::new::<foo>((0, 1, 2));
-        // assert_eq!(request.function_selector, [0; 4]);
+        let _request = Request::serialize::<foo>((0, 1, 2));
     }
 
     #[test]
     fn contract() {
-        use pwasm::{Contract, ContractDef, EthEnv, TxInfo};
+        use pwasm::{Contract, ContractDef, EthEnv};
 
         messages! {
             Add(u32);
             Get() -> u32;
+            GetNoMacro() -> u32;
             AssertVec();
             Unused();
         }
@@ -1103,36 +1396,47 @@ mod test {
         //       `EthEnv`, only a dummy version.
         let env = EthEnv::new();
 
+        // static BAD_TIMES_MUTEX: Mutex<pwasm::Field<pwasm::marker::Mut,
+
         let definition = Contract::new()
             .constructor(|state: &mut State, _txdata| {
-                state.current().set(1);
-                state.calls_to_add().set(0);
-                state
-                    .vec()
-                    .set((0..1024usize).collect::<Vec<_>>());
+                state.current().insert(1);
+                state.calls_to_add().insert(0);
+                state.vec().insert((0..1024usize).collect::<Vec<_>>());
             })
             .on_msg_mut::<Add>(|_env, state, to_add| {
                 *state.calls_to_add() += 1;
                 *state.current() += to_add;
             })
             .on_msg::<Get>(|_env, state, ()| *state.current())
+            .on_msg::<GetNoMacro>(|_env, _state, ()| {
+                use pwasm::Field;
+
+                static CURRENT: &str = "current";
+
+                let val: u32 = *Field::get(CURRENT);
+                // No safety rails here, you can modify the state in an "immutable"
+                // message handler. This will fail if you were called with `call_static`
+                // however
+                Field::set(CURRENT, 10u32);
+                let out = *Field::get(CURRENT);
+                Field::set(CURRENT, val);
+
+                out
+            })
             .on_msg::<AssertVec>(|_env, state, ()| {
-                assert_eq!(
-                    *state.vec(),
-                    (0..1024usize).collect::<Vec<_>>()
-                );
+                assert_eq!(*state.vec(), (0..1024usize).collect::<Vec<_>>());
             });
 
-        // `TxInfo` is the information on the existing transaction
-        let mut contract = definition.deploy(&env, TxInfo::new());
+        let mut contract = definition.deploy(&env, ());
 
-        let _: () = contract.call::<Add>(1);
+        let () = contract.call::<Add>(1);
         let val: u32 = contract.call::<Get>(());
-        let _: () = contract.call::<AssertVec>(());
+        let val_no_macro: u32 = contract.call::<GetNoMacro>(());
 
-        // Doesn't compile
-        // contract.call::<Unused>(()).unwrap();
+        contract.call::<AssertVec>(());
 
+        assert_eq!(val_no_macro, 10);
         assert_eq!(val, 2);
         assert_eq!(*contract.state.current(), 2,);
         assert_eq!(*contract.state.calls_to_add(), 1,);
