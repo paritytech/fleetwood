@@ -1,6 +1,6 @@
 # Fleetwood
 
-This is a (in-development) eDSL library for writing portable, efficient and safe smart contracts in Rust. The goal is to be _at least_ as ergonomic as writing Solidity while improving on it in library and tooling support, but that's only the absolute minimum goal. The complete list of goals are:
+This is an (in-development) eDSL library for writing portable, efficient and safe smart contracts in Rust. The goal is to be _at least_ as ergonomic as writing Solidity while improving on it in library and tooling support, but that's only the absolute minimum goal. The complete list of goals are:
 
 * To allow easy integration with the Rust library ecosystem;
 * To allow Rust tooling to work out-of-the-box on smart contract code. Auto-completion, syntax highlighting, code coverage for tests, go-to definition and other RLS goodies, these should all work without any custom configuration;
@@ -12,7 +12,7 @@ This is a (in-development) eDSL library for writing portable, efficient and safe
 * To make testing as easy as using `cargo test`, and make most testing be possible without a blockchain client at all;
 * To make building as easy as using `cargo build` (this doesn't necessarily mean that you will be able to just type `cargo build`, it might need a seperate subcommand).
 
-## Roadmap:
+## Roadmap
 
 ### July 2018
 
