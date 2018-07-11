@@ -1,25 +1,44 @@
-#![cfg_attr(not(feature = "std"), no_std)]
-#![allow(dead_code)]
-
 #[macro_use]
 extern crate lazy_static;
+#[macro_use]
+extern crate serde_derive;
 
 extern crate bigint;
 extern crate bincode;
-extern crate core;
 extern crate either;
+extern crate metrohash;
 extern crate parity_hash;
 extern crate pwasm_abi;
 extern crate serde;
 extern crate tiny_keccak;
 
-pub mod shim {
-    use parity_hash::H256;
+mod pwasm_ethereum {
+    use parity_hash::{Address, H256};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
     lazy_static! {
         static ref STORAGE_MUTEX: Mutex<HashMap<[u8; 32], [u8; 32]>> = Mutex::new(HashMap::new());
+    }
+
+    pub fn ret(_data: &[u8]) -> ! {
+        unimplemented!()
+    }
+
+    pub fn input() -> Vec<u8> {
+        vec![]
+    }
+
+    pub fn address() -> Address {
+        Address::from([3; 20])
+    }
+
+    pub fn sender() -> Address {
+        Address::from([2; 20])
+    }
+
+    pub fn origin() -> Address {
+        Address::from([1; 20])
     }
 
     pub fn write(key: &H256, val: &[u8; 32]) {
@@ -39,388 +58,443 @@ pub mod shim {
     }
 }
 
-use shim as pwasm_ethereum;
+use bigint::U256;
+use metrohash::MetroHash;
+use parity_hash::{Address, H256};
+use pwasm_abi::eth::{Sink, Stream};
+use serde::{Deserialize, Serialize};
+use std::any::{Any, TypeId};
+use std::cell::{Cell, UnsafeCell};
+use std::hash::{BuildHasher, Hash};
+use std::io::{self, Cursor};
+use std::iter;
+use std::marker::PhantomData;
+use std::mem;
+use std::ops::{Deref, DerefMut, Drop};
+use std::result::Result as StdResult;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-mod pwasm {
-    use bigint::U256;
-    use core::hash::Hash;
-    use core::iter;
-    use core::marker::PhantomData;
-    use core::result::Result as StdResult;
-    use parity_hash::H256;
-    use pwasm_abi::eth::{Sink, Stream};
-    use std::io;
+fn increment(hash: &mut [u8]) {
+    let mut overflow = true;
 
-    use pwasm_ethereum;
-
-    use serde::{Deserialize, Serialize};
-
-    fn increment(hash: &mut H256) {
-        let mut overflow = true;
-
-        loop {
-            for i in hash[..].iter_mut() {
-                if overflow {
-                    let (val, new_overflow) = i.overflowing_add(1);
-                    *i = val;
-                    overflow = new_overflow;
-                } else {
-                    return;
-                }
-            }
-        }
-    }
-
-    pub mod marker {
-        pub trait BorrowMarker {
-            type Store: Default;
-
-            fn mark_changed(_store: &Self::Store) {}
-            fn is_changed(_store: &Self::Store) -> bool {
-                false
-            }
-        }
-
-        pub trait BorrowMut: BorrowMarker {}
-
-        pub struct Mut;
-        pub struct Immut;
-
-        impl BorrowMut for Mut {}
-
-        impl BorrowMarker for Immut {
-            type Store = ();
-        }
-
-        impl BorrowMarker for Mut {
-            type Store = ::std::cell::Cell<bool>;
-
-            fn mark_changed(store: &Self::Store) {
-                store.set(true);
-            }
-
-            fn is_changed(store: &Self::Store) -> bool {
-                store.get()
-            }
-        }
-    }
-
-    use self::marker::{BorrowMarker, BorrowMut};
-
-    pub struct Field<'a, Marker, T: 'a>
-    where
-        Marker: BorrowMarker,
-        T: ::serde::Serialize,
-    {
-        key: H256,
-        _marker: PhantomData<(Marker, &'a T)>,
-        current: ::std::cell::UnsafeCell<Option<T>>,
-        changes: Marker::Store,
-    }
-
-    impl<'a, M, T> Field<'a, M, T>
-    where
-        M: BorrowMarker,
-        T: for<'any> ::serde::Deserialize<'any> + ::serde::Serialize,
-    {
-        pub fn new(name: &'static str) -> Self {
-            // TODO: we want to use a cheaper hashing algorithm for this.
-            let mut keccak = ::tiny_keccak::Keccak::new_sha3_256();
-
-            keccak.update(name.as_bytes());
-
-            let mut out = [0u8; 32];
-            keccak.finalize(&mut out);
-            Field {
-                key: H256(out),
-                current: ::std::cell::UnsafeCell::new(None),
-                changes: Default::default(),
-                _marker: Default::default(),
-            }
-        }
-
-        unsafe fn populate(&self) {
-            if (*self.current.get()).is_none() {
-                *self.current.get() = Some(
-                    ::bincode::deserialize_from::<_, T>(EthStateReader::new(self.key.clone()))
-                        .expect("Couldn't deserialize"),
-                );
-            }
-        }
-    }
-
-    impl<'a, T> Field<'a, self::marker::Immut, T>
-    where
-        T: for<'any> ::serde::Deserialize<'any> + ::serde::Serialize,
-    {
-        pub fn get(name: &'static str) -> Self {
-            Self::new(name)
-        }
-    }
-
-    impl<'a, T: 'a> Field<'a, self::marker::Mut, T>
-    where
-        T: for<'any> ::serde::Deserialize<'any> + ::serde::Serialize,
-    {
-        pub fn get_mut(name: &'static str) -> Self {
-            Self::new(name)
-        }
-
-        pub fn set(name: &'static str, val: T) {
-            Self::get_mut(name).insert(val)
-        }
-    }
-
-    impl<'a, M, T> Field<'a, M, T>
-    where
-        M: BorrowMut + BorrowMarker,
-        T: for<'any> ::serde::Deserialize<'any> + ::serde::Serialize,
-    {
-        pub fn insert(&self, val: T) {
-            M::mark_changed(&self.changes);
-            unsafe { *self.current.get() = Some(val) };
-        }
-    }
-
-    impl<'a, M, T> ::std::ops::Drop for Field<'a, M, T>
-    where
-        M: BorrowMarker,
-        T: ::serde::Serialize,
-    {
-        fn drop(&mut self) {
-            if M::is_changed(&self.changes) {
-                use std::io::Write;
-                let mut writer =
-                    EthStateWriter::new(::std::mem::replace(&mut self.key, Default::default()));
-                ::bincode::serialize_into(
-                    &mut writer,
-                    unsafe { &*self.current.get() }.as_ref().unwrap(),
-                ).unwrap();
-                writer.flush().unwrap();
-            }
-        }
-    }
-
-    impl<'a, M, T> ::std::ops::Deref for Field<'a, M, T>
-    where
-        M: BorrowMarker,
-        T: for<'any> ::serde::Deserialize<'any> + ::serde::Serialize,
-    {
-        type Target = T;
-
-        fn deref(&self) -> &T {
-            unsafe {
-                self.populate();
-
-                Option::as_ref(&mut *self.current.get()).unwrap()
-            }
-        }
-    }
-
-    impl<'a, M, T> ::std::ops::DerefMut for Field<'a, M, T>
-    where
-        M: BorrowMut + BorrowMarker,
-        T: for<'any> ::serde::Deserialize<'any> + ::serde::Serialize,
-    {
-        fn deref_mut(&mut self) -> &mut T {
-            unsafe {
-                self.populate();
-
-                M::mark_changed(&self.changes);
-
-                Option::as_mut(&mut *self.current.get()).unwrap()
-            }
-        }
-    }
-
-    struct EthStateReader {
-        key: H256,
-        val: [u8; 32],
-        index: usize,
-    }
-
-    impl EthStateReader {
-        fn new(key: H256) -> Self {
-            EthStateReader {
-                key,
-                val: pwasm_ethereum::read(&key),
-                index: 0,
-            }
-        }
-    }
-
-    impl io::Read for EthStateReader {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            let len = buf.len();
-            let mut index = 0;
-
-            while !buf[index..].is_empty() {
-                let buf = &mut buf[index..];
-
-                let to_consume = (self.val.len() - self.index).min(buf.len());
-                buf[..to_consume].copy_from_slice(&self.val[self.index..self.index + to_consume]);
-
-                self.index += to_consume;
-                index += to_consume;
-
-                if self.index == self.val.len() {
-                    increment(&mut self.key);
-                    self.val = pwasm_ethereum::read(&self.key);
-                    self.index = 0;
-                }
-            }
-
-            Ok(len)
-        }
-    }
-
-    struct EthStateWriter {
-        key: H256,
-        val: [u8; 32],
-        index: usize,
-    }
-
-    impl EthStateWriter {
-        fn new(key: H256) -> Self {
-            EthStateWriter {
-                key,
-                val: [0; 32],
-                index: 0,
-            }
-        }
-    }
-
-    impl io::Write for EthStateWriter {
-        fn write(&mut self, mut val: &[u8]) -> io::Result<usize> {
-            let len = val.len();
-            while !val.is_empty() {
-                if self.index == self.val.len() {
-                    self.flush()?;
-                    increment(&mut self.key);
-                    self.index = 0;
-                }
-
-                let consumed = (self.val.len() - self.index).min(val.len());
-
-                self.val[self.index..self.index + consumed].copy_from_slice(&val[..consumed]);
-
-                self.index += consumed;
-
-                val = &val[consumed..];
-            }
-
-            Ok(len)
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            pwasm_ethereum::write(&self.key, &self.val);
-
-            Ok(())
-        }
-    }
-
-    // Replacement for `HashMap` that doesn't require serializing/deserializing the
-    // full map every time you attempt to run a handler.
-    pub struct Database<K, V> {
-        seed: u64,
-        _marker: PhantomData<(K, V)>,
-    }
-
-    impl<K: Hash, V: Serialize + for<'a> Deserialize<'a>> Database<K, V> {
-        fn insert(&mut self, _key: &K, _val: V) {
-            unimplemented!()
-        }
-
-        fn get(&self, _key: &K) -> V {
-            unimplemented!()
-        }
-    }
-
-    #[derive(Debug)]
-    pub enum Error {
-        NoMethodError,
-        DecodeError(::pwasm_abi::eth::Error),
-    }
-
-    impl From<::pwasm_abi::eth::Error> for Error {
-        fn from(other: ::pwasm_abi::eth::Error) -> Self {
-            Error::DecodeError(other)
-        }
-    }
-
-    pub type Result<T> = StdResult<T, Error>;
-
-    pub struct Request {
-        selector: [u8; 4],
-        input: Vec<u8>,
-    }
-
-    impl Request {
-        pub fn new(input: Vec<u8>) -> Option<Self> {
-            if input.len() >= 4 {
-                Some(Request {
-                    selector: [input[0], input[1], input[2], input[3]],
-                    input,
-                })
+    loop {
+        for i in hash.iter_mut() {
+            if overflow {
+                let (val, new_overflow) = i.overflowing_add(1);
+                *i = val;
+                overflow = new_overflow;
             } else {
-                None
-            }
-        }
-
-        pub fn to_stream(&self) -> Stream {
-            Stream::new(&self.input[4..])
-        }
-
-        pub fn deserialize_input_for<M: Message>(
-            &self,
-        ) -> StdResult<M::Input, ::pwasm_abi::eth::Error> {
-            DecodeSolidityArgs::pop(&mut self.to_stream())
-        }
-
-        pub fn function_selector(&self) -> [u8; 4] {
-            [self.input[0], self.input[1], self.input[2], self.input[3]]
-        }
-
-        // For testing
-        pub fn serialize<M: Message>(input: M::Input) -> Self
-        where
-            M::Input: EncodeSolidityArgs,
-        {
-            let sel = M::selector();
-            let mut out = sel.to_vec();
-            let mut sink = Sink::new(input.count());
-            input.push(&mut sink);
-            sink.drain_to(&mut out);
-
-            Request {
-                selector: sel,
-                input: out,
+                return;
             }
         }
     }
+}
 
-    fn make_selector<'a, I: IntoIterator<Item = &'a str>>(iter: I) -> [u8; 4] {
-        let mut keccak = ::tiny_keccak::Keccak::new_keccak256();
+enum Void {}
 
-        for element in iter {
-            keccak.update(element.as_bytes());
+pub trait Wrapper<T> {}
+
+pub trait FieldName {
+    fn name(&self) -> &'static str;
+}
+
+pub struct RuntimeFieldName(&'static str);
+
+impl FieldName for RuntimeFieldName {
+    #[inline]
+    fn name(&self) -> &'static str {
+        self.0
+    }
+}
+
+pub struct Field<Env: HasStorage, T, N: FieldName = RuntimeFieldName>
+where
+    T: ::serde::Serialize,
+{
+    key: Env::Key,
+    name: N,
+    _marker: PhantomData<T>,
+    current: UnsafeCell<Option<T>>,
+    changes: Cell<bool>,
+}
+
+impl<Env: HasStorage, T, N: FieldName> Field<Env, T, N>
+where
+    T: for<'any> ::serde::Deserialize<'any> + ::serde::Serialize,
+{
+    pub fn set(&mut self, val: T) {
+        self.changes.set(true);
+        unsafe { *self.current.get() = Some(val) };
+    }
+}
+
+impl<Env: HasStorage, T, N: FieldName + Default> From<T> for Field<Env, T, N>
+where
+    T: ::serde::Serialize,
+    Env::Key: Key,
+{
+    fn from(from: T) -> Self {
+        let name = N::default();
+        Field {
+            key: Key::from_bytes(name.name().as_bytes()),
+            name: name,
+            current: UnsafeCell::new(Some(from)),
+            changes: Cell::new(true),
+            _marker: Default::default(),
+        }
+    }
+}
+
+impl<Env: HasStorage, T, N: FieldName + Default> Default for Field<Env, T, N>
+where
+    T: ::serde::Serialize,
+    Env::Key: Key,
+{
+    fn default() -> Self {
+        let name = N::default();
+        Field {
+            key: Key::from_bytes(name.name().as_bytes()),
+            name: name,
+            current: UnsafeCell::new(None),
+            changes: Default::default(),
+            _marker: Default::default(),
+        }
+    }
+}
+
+fn quickhash(name: &[u8]) -> H256 {
+    // TODO: we want to use a cheaper hashing algorithm for this.
+    let mut keccak = ::tiny_keccak::Keccak::new_sha3_256();
+
+    keccak.update(name);
+
+    let mut out = [0u8; 32];
+    keccak.finalize(&mut out);
+
+    H256(out)
+}
+
+impl<Env: HasStorage, T> Field<Env, T>
+where
+    T: for<'any> ::serde::Deserialize<'any> + ::serde::Serialize,
+    Env::Key: Key,
+{
+    pub fn new(name: &'static str) -> Self {
+        Field {
+            key: Key::from_bytes(name.as_bytes()),
+            name: RuntimeFieldName(name),
+            current: UnsafeCell::new(None),
+            changes: Default::default(),
+            _marker: Default::default(),
+        }
+    }
+
+    pub fn read(name: &'static str) -> Self {
+        Self::new(name)
+    }
+
+    pub fn write(name: &'static str, val: T) {
+        Self::new(name).set(val)
+    }
+
+    pub fn flush(&mut self) {
+        if self.changes.get() {
+            use std::io::Write;
+            let mut writer = StateWriter::<Env>::new(&mut self.key, &mut Default::default());
+            ::bincode::serialize_into(
+                &mut writer,
+                unsafe { &*self.current.get() }.as_ref().unwrap(),
+            ).unwrap();
+            writer.flush().unwrap();
+        }
+    }
+}
+
+impl<Env: HasStorage, T, N: FieldName> Field<Env, T, N>
+where
+    T: for<'any> ::serde::Deserialize<'any> + ::serde::Serialize,
+{
+    unsafe fn populate(&self) {
+        if (*self.current.get()).is_none() {
+            *self.current.get() = Some(
+                // TODO: This relies on (de)serialize impls being correct and the only
+                //       method to store data being via `Field`. We should have a better
+                //       way to do this.
+                ::bincode::deserialize_from::<_, T>(StateReader::<Env>::new(self.key.clone()))
+                    .expect("Couldn't deserialize"),
+            );
+        }
+    }
+}
+
+impl<Env: HasStorage, T, N: FieldName> Deref for Field<Env, T, N>
+where
+    T: for<'any> ::serde::Deserialize<'any> + ::serde::Serialize,
+{
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        unsafe {
+            self.populate();
+
+            Option::as_ref(&mut *self.current.get()).unwrap()
+        }
+    }
+}
+
+impl<Env: HasStorage, T, N: FieldName> DerefMut for Field<Env, T, N>
+where
+    T: for<'any> ::serde::Deserialize<'any> + ::serde::Serialize,
+{
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe {
+            self.populate();
+
+            self.changes.set(true);
+
+            Option::as_mut(&mut *self.current.get()).unwrap()
+        }
+    }
+}
+
+struct StateReader<Env: HasStorage> {
+    key: Env::Key,
+    val: Cursor<Env::Value>,
+}
+
+impl<Env: HasStorage> StateReader<Env> {
+    fn new(key: Env::Key) -> Self {
+        StateReader {
+            key,
+            val: Cursor::new(Env::read(&key)),
+        }
+    }
+}
+
+impl<Env: HasStorage> io::Read for StateReader<Env> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let len = buf.len();
+        let mut index = 0;
+
+        while !buf[index..].is_empty() {
+            if self.val.position() == self.val.get_ref().as_ref().len() as _ {
+                increment(self.key.as_mut());
+                self.val = Cursor::new(Env::read(&self.key));
+            }
+
+            let consumed = self.val.read(&mut buf[index..])?;
+
+            index += consumed;
         }
 
-        let mut out = [0u8; 4];
-        keccak.finalize(&mut out);
-        out
+        Ok(len)
+    }
+}
+
+struct StateWriter<'a, Env: HasStorage>
+where
+    Env::Key: 'a,
+    Env::Value: 'a,
+{
+    key: &'a mut Env::Key,
+    val: &'a mut Env::Value,
+    index: usize,
+}
+
+impl<'a, Env: HasStorage> StateWriter<'a, Env> {
+    fn new(key: &'a mut Env::Key, scratch: &'a mut Env::Value) -> Self {
+        StateWriter {
+            key,
+            val: scratch,
+            index: 0,
+        }
+    }
+}
+
+impl<'a, Env: HasStorage> io::Write for StateWriter<'a, Env>
+where
+    // All this complexity is to abstract over `&mut [u8]` and `&mut Vec<u8>`, since one is fixed-size
+    // and the other infinitely grows
+    for<'any> std::io::Cursor<&'any mut <<Env as HasStorage>::Value as Value>::Reference>:
+        io::Write,
+{
+    fn write(&mut self, mut val: &[u8]) -> io::Result<usize> {
+        let len = val.len();
+        let mut writeable = Cursor::new(self.val.as_writeable());
+        writeable.set_position(self.index as u64);
+        while !val.is_empty() {
+            if Env::Value::is_finished(self.index) {
+                self.flush()?;
+                increment(self.key.as_mut());
+                writeable.set_position(0);
+            }
+
+            let consumed = writeable.write(val)?;
+            self.index = writeable.position() as usize;
+
+            val = &val[consumed..];
+        }
+
+        Ok(len)
     }
 
-    pub trait DecodeSolidityArgs: Sized {
-        fn pop(stream: &mut Stream) -> StdResult<Self, ::pwasm_abi::eth::Error>;
+    fn flush(&mut self) -> io::Result<()> {
+        Env::write(&Env::Key::from_bytes(self.key.as_ref()), &self.val);
+
+        Ok(())
+    }
+}
+
+static DATABASE_SEED: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Serialize, Deserialize)]
+pub struct IncrementingState(usize);
+
+impl IncrementingState {
+    fn new() -> Self {
+        DATABASE_SEED.fetch_add(1, Ordering::Relaxed) as u64
+    }
+}
+
+#[allow(deprecated)]
+impl BuildHasher for IncrementingState {
+    type Hasher = MetroHash;
+
+    #[inline]
+    fn build_hasher(&self) -> Self::Hasher {
+        MetroHash::with_seed(self.0 as _)
+    }
+}
+
+// Replacement for `HashMap` that doesn't require serializing/deserializing the
+// full map every time you attempt to run a handler.
+#[derive(Serialize, Deserialize)]
+pub struct Database<Env, K, V, S = IncrementingState> {
+    builder: S,
+    _marker: PhantomData<(fn() -> Env, K, V)>,
+}
+
+impl<Env: HasStorage, K: Hash, V: Serialize + for<'a> Deserialize<'a>> Database<Env, K, V> {
+    pub fn new() -> Self {
+        Database {
+            builder: IncrementingState::new(),
+            _marker: PhantomData,
+        }
     }
 
-    pub trait EncodeSolidityArgs: Sized {
-        fn push(self, stream: &mut Sink);
-        fn count(&self) -> usize;
+    fn hash(&self, key: &K) -> H256 {
+        // TODO: we want to use a cheaper hashing algorithm for this.
+        let mut hasher = self.builder.build_hasher();
+        key.hash(&mut hasher);
+
+        let mut out = [0u8; 32];
+        hasher.finalize(&mut out);
+
+        H256(out)
     }
 
-    macro_rules! impl_solidityargs_abitype {
+    pub fn insert(&mut self, key: &K, val: V) {
+        use std::io::Write;
+        let mut writer = StateWriter::<Env>::new(
+            &mut Env::Key::from_bytes(&self.hash(key)),
+            &mut Default::default(),
+        );
+        ::bincode::serialize_into(&mut writer, &val).unwrap();
+        writer.flush().unwrap();
+    }
+
+    pub fn get(&self, key: &K) -> V {
+        ::bincode::deserialize_from(StateReader::new(self.hash(key))).expect("Couldn't deserialize")
+    }
+}
+
+#[derive(Debug)]
+pub enum Error {
+    NoMethodError,
+    DecodeError(::pwasm_abi::eth::Error),
+}
+
+impl From<::pwasm_abi::eth::Error> for Error {
+    fn from(other: ::pwasm_abi::eth::Error) -> Self {
+        Error::DecodeError(other)
+    }
+}
+
+pub type Result<T> = StdResult<T, Error>;
+
+pub struct Request {
+    selector: [u8; 4],
+    input: Vec<u8>,
+}
+
+impl Request {
+    pub fn new(input: Vec<u8>) -> Option<Self> {
+        if input.len() >= 4 {
+            Some(Request {
+                selector: [input[0], input[1], input[2], input[3]],
+                input,
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn to_stream(&self) -> Stream {
+        Stream::new(&self.input[4..])
+    }
+
+    pub fn deserialize_input_for<M: Message>(
+        &self,
+    ) -> StdResult<M::Input, ::pwasm_abi::eth::Error> {
+        DecodeSolidityArgs::pop(&mut self.to_stream())
+    }
+
+    pub fn function_selector(&self) -> [u8; 4] {
+        [self.input[0], self.input[1], self.input[2], self.input[3]]
+    }
+
+    // For testing
+    pub fn serialize<M: Message>(input: M::Input) -> Self
+    where
+        M::Input: EncodeSolidityArgs,
+    {
+        let sel = M::selector();
+        let mut out = sel.to_vec();
+        let mut sink = Sink::new(input.count());
+        input.push(&mut sink);
+        sink.drain_to(&mut out);
+
+        Request {
+            selector: sel,
+            input: out,
+        }
+    }
+}
+
+fn make_selector<'a, I: IntoIterator<Item = &'a str>>(iter: I) -> [u8; 4] {
+    let mut keccak = ::tiny_keccak::Keccak::new_keccak256();
+
+    for element in iter {
+        keccak.update(element.as_bytes());
+    }
+
+    let mut out = [0u8; 4];
+    keccak.finalize(&mut out);
+    out
+}
+
+pub trait DecodeSolidityArgs: Sized {
+    fn pop(stream: &mut Stream) -> StdResult<Self, ::pwasm_abi::eth::Error>;
+}
+
+pub trait EncodeSolidityArgs: Sized {
+    fn push(self, stream: &mut Sink);
+    fn count(&self) -> usize;
+}
+
+pub trait SolidityReturnType: EncodeSolidityArgs {}
+
+macro_rules! impl_solidityargs_abitype {
         ($($typ:ty,)*) => {
             $(
                 impl DecodeSolidityArgs for $typ {
@@ -445,6 +519,8 @@ mod pwasm {
                     }
                 }
 
+                impl SolidityReturnType for $typ { }
+
                 impl EncodeSolidityArgs for Vec<$typ> {
                     fn push(self, sink: &mut Sink) {
                         sink.push(self)
@@ -458,51 +534,51 @@ mod pwasm {
         };
     }
 
-    impl_solidityargs_abitype! {
-        Vec<u8>,
-        U256,
-        ::parity_hash::Address,
-        ::parity_hash::H256,
-        u32,
-        u64,
-        i32,
-        i64,
-        bool,
-        [u8; 1],
-        [u8; 2],
-        [u8; 3],
-        [u8; 4],
-        [u8; 5],
-        [u8; 6],
-        [u8; 7],
-        [u8; 8],
-        [u8; 9],
-        [u8; 10],
-        [u8; 11],
-        [u8; 12],
-        [u8; 13],
-        [u8; 14],
-        [u8; 15],
-        [u8; 16],
-        [u8; 17],
-        [u8; 18],
-        [u8; 19],
-        [u8; 20],
-        [u8; 21],
-        [u8; 22],
-        [u8; 23],
-        [u8; 24],
-        [u8; 25],
-        [u8; 26],
-        [u8; 27],
-        [u8; 28],
-        [u8; 29],
-        [u8; 30],
-        [u8; 31],
-        [u8; 32],
-    }
+impl_solidityargs_abitype! {
+    Vec<u8>,
+    U256,
+    ::parity_hash::Address,
+    ::parity_hash::H256,
+    u32,
+    u64,
+    i32,
+    i64,
+    bool,
+    [u8; 1],
+    [u8; 2],
+    [u8; 3],
+    [u8; 4],
+    [u8; 5],
+    [u8; 6],
+    [u8; 7],
+    [u8; 8],
+    [u8; 9],
+    [u8; 10],
+    [u8; 11],
+    [u8; 12],
+    [u8; 13],
+    [u8; 14],
+    [u8; 15],
+    [u8; 16],
+    [u8; 17],
+    [u8; 18],
+    [u8; 19],
+    [u8; 20],
+    [u8; 21],
+    [u8; 22],
+    [u8; 23],
+    [u8; 24],
+    [u8; 25],
+    [u8; 26],
+    [u8; 27],
+    [u8; 28],
+    [u8; 29],
+    [u8; 30],
+    [u8; 31],
+    [u8; 32],
+}
 
-    macro_rules! impl_solidityargs_tup {
+macro_rules! impl_solidityargs_tup {
         ($first:ident $(, $rest:ident)*) => {
             impl<$first, $($rest,)*> DecodeSolidityArgs for ($first, $($rest,)*)
             where
@@ -563,171 +639,246 @@ mod pwasm {
                     0
                 }
             }
+
+            impl SolidityReturnType for () { }
         };
     }
 
-    impl_solidityargs_tup!(A, B, C, D, E, F, G, H, I, J, K);
+impl_solidityargs_tup!(A, B, C, D, E, F, G, H, I, J, K);
 
-    pub trait Response {
-        fn output_for<M: Message>(self) -> Option<M::Output>
-        where
-            M::Output: Any;
+pub trait Response {
+    fn output_for<M: Message>(self) -> Option<M::Output>
+    where
+        M::Output: Any;
+
+    fn serialize(self) -> Vec<u8>;
+}
+
+impl<Head: Any + EncodeSolidityArgs, Rest> Response for Either<Head, Rest>
+where
+    Rest: Response,
+{
+    fn output_for<M: Message>(self) -> Option<M::Output>
+    where
+        M::Output: Any,
+    {
+        use std::any::TypeId;
+        use std::{mem, ptr};
+
+        match self {
+            Either::Left(left) => if TypeId::of::<Head>() == TypeId::of::<M::Output>() {
+                let out = unsafe { ptr::read(&left as *const Head as *const M::Output) };
+
+                mem::forget(left);
+
+                Some(out)
+            } else {
+                None
+            },
+            Either::Right(right) => right.output_for::<M>(),
+        }
     }
 
-    use std::any::Any;
-
-    impl<Head: Any, Rest> Response for Either<Head, Rest>
-    where
-        Rest: Response,
-    {
-        fn output_for<M: Message>(self) -> Option<M::Output>
-        where
-            M::Output: Any,
-        {
-            use std::any::TypeId;
-            use std::{mem, ptr};
-
-            match self {
-                Either::Left(left) => if TypeId::of::<Head>() == TypeId::of::<M::Output>() {
-                    let out = unsafe { ptr::read(&left as *const Head as *const M::Output) };
-
-                    mem::forget(left);
-
-                    Some(out)
-                } else {
-                    None
-                },
-                Either::Right(right) => right.output_for::<M>(),
+    fn serialize(self) -> Vec<u8> {
+        match self {
+            Either::Left(left) => {
+                let mut sink = Sink::new(left.count());
+                left.push(&mut sink);
+                sink.finalize_panicking()
             }
+            Either::Right(right) => right.serialize(),
         }
     }
+}
 
-    impl Response for Void {
-        fn output_for<M: Message>(self) -> Option<M::Output>
-        where
-            M::Output: Any,
-        {
-            None
-        }
-    }
-
-    // TODO: Should we build on deployment or should there be a "deploy" step? Building on deployment is _way_
-    //       simpler.
-    pub fn deploy_data() -> DeployData {
-        DeployData {
-            deployer: U256::from(0),
-        }
-    }
-
-    pub struct ContractInstance<'a, S, T: 'a> {
-        pub env: &'a EthEnv,
-        pub state: S,
-        contract: &'a T,
-    }
-
-    impl<'a, S, T> ContractInstance<'a, S, T>
+impl Response for Void {
+    fn output_for<M: Message>(self) -> Option<M::Output>
     where
-        S: Default,
-        T: ContractDef<State = S>,
-        T::Output: Response,
+        M::Output: Any,
     {
-        pub fn call<M: Message>(&mut self, input: M::Input) -> M::Output
-        where
-            // TODO
-            M::Output: 'static,
-            M::Input: DecodeSolidityArgs + EncodeSolidityArgs,
-        {
-            Response::output_for::<M>(self.contract.send_request(
-                self.env,
-                &mut self.state,
-                Request::serialize::<M>(input),
-            )).expect("Didn't respond to message")
-        }
+        None
     }
 
-    pub trait ContractDef {
-        type Input;
-        type State: Default;
-        type Output: Response + 'static;
+    fn serialize(self) -> Vec<u8> {
+        unimplemented!()
+    }
+}
 
-        // We have this function to allow easy testing for users. For a lot of functions they don't need
-        // to deploy to the blockchain at all.
-        fn send_request(
-            &self,
-            _env: &EthEnv,
-            state: &mut Self::State,
-            input: Request,
-        ) -> Self::Output;
+// TODO: Should we build on deployment or should there be a "deploy" step? Building on deployment is _way_
+//       simpler.
+pub fn deploy_data() -> DeployData {
+    DeployData {
+        deployer: U256::from(0),
+    }
+}
 
-        fn construct(&self, state: &mut Self::State, input: Self::Input);
+pub trait Key: AsRef<[u8]> + AsMut<[u8]> + Clone {
+    fn from_bytes(bytes: &[u8]) -> Self;
+}
 
-        fn deploy<'a>(
-            &'a self,
-            env: &'a EthEnv,
-            input: Self::Input,
-        ) -> ContractInstance<'a, Self::State, Self>
-        where
-            Self: Sized,
-        {
-            let mut state = Default::default();
-            self.construct(&mut state, input);
-            ContractInstance {
-                env,
-                state,
-                contract: self,
-            }
-        }
+pub trait Value: AsRef<[u8]> + AsMut<[u8]> + Default {
+    type Reference: ?Sized;
 
-        fn call<M: Message>(
-            &self,
-            env: &EthEnv,
-            state: &mut Self::State,
-            input: M::Input,
-        ) -> Option<M::Output>
-        where
-            Self::Output: Response,
-            Self: Sized,
-            M::Output: 'static,
-            M::Input: EncodeSolidityArgs,
-        {
-            Response::output_for::<M>(self.send_request(env, state, Request::serialize::<M>(input)))
-        }
+    fn is_finished(index: usize) -> bool;
+    fn as_writeable(&mut self) -> &mut Self::Reference;
+}
+
+impl Value for [u8; 32] {
+    type Reference = [u8];
+
+    fn is_finished(index: usize) -> bool {
+        index >= 32
     }
 
-    impl<C, H> ContractDef for Contract<C, H>
+    fn as_writeable(&mut self) -> &mut Self::Reference {
+        self
+    }
+}
+
+impl Value for Vec<u8> {
+    type Reference = Vec<u8>;
+
+    fn is_finished(index: usize) -> bool {
+        false
+    }
+
+    fn as_writeable(&mut self) -> &mut Self::Reference {
+        self
+    }
+}
+
+impl Key for H256 {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        if bytes.len() < 32 {
+            let mut out = [0; 32];
+            out.copy_from_slice(bytes);
+            out.into()
+        } else {
+            quickhash(bytes)
+        }
+    }
+}
+
+pub trait HasStorage {
+    type Key: Key;
+    type Value: Value;
+
+    fn read(key: &Self::Key) -> Self::Value;
+    fn write(key: &Self::Key, value: &Self::Value);
+}
+
+pub trait Environment: HasStorage {}
+
+pub struct ContractInstance<'a, Env: 'a, T: ContractDef<Env> + 'a> {
+    pub env: &'a Env,
+    pub state: T::State,
+    contract: &'a T,
+}
+
+impl<'a, Env, T> ContractInstance<'a, Env, T>
+where
+    T: ContractDef<Env>,
+    T::State: EmptyState,
+    T::Output: Response,
+{
+    pub fn call<M: Message>(&mut self, input: M::Input) -> M::Output
     where
-        C: Constructor,
-        H: Handlers<C::State>,
-        C::State: Default,
+        // TODO
+        M::Output: 'static,
+        M::Input: DecodeSolidityArgs + EncodeSolidityArgs,
     {
-        type State = C::State;
-        type Input = C::Input;
-        type Output = H::Output;
+        Response::output_for::<M>(self.contract.send_request(
+            self.env,
+            &mut self.state,
+            Request::serialize::<M>(input),
+        )).expect("Didn't respond to message")
+    }
+}
 
-        fn construct(&self, state: &mut C::State, txdata: C::Input) {
-            self.constructor.call(state, txdata)
-        }
+pub trait State {
+    fn empty() -> Self;
+    /// Flush the state to the database (assuming this is a list of fields, this just
+    /// means recursively flushing each field)
+    fn flush(&mut self);
+}
 
-        fn send_request(&self, env: &EthEnv, state: &mut C::State, input: Request) -> Self::Output {
-            self.handlers.handle(env, state, input).expect("No method")
+pub trait ContractDef<Env> {
+    type Input: DecodeSolidityArgs;
+    type State: EmptyState;
+    type Output: Response + 'static;
+
+    fn send_request(&self, _env: &Env, state: &mut Self::State, input: Request) -> Self::Output;
+
+    fn construct(&self, input: Self::Input) -> Self::State;
+
+    fn construct_raw(&self, input: &[u8]) -> Self::State {
+        self.construct(
+            DecodeSolidityArgs::pop(&mut Stream::new(input)).expect("Failed to construct"),
+        )
+    }
+
+    fn deploy<'a>(&'a self, env: &'a Env, input: Self::Input) -> ContractInstance<'a, Env, Self>
+    where
+        Self: Sized,
+    {
+        let state = self.construct(input);
+        ContractInstance {
+            env,
+            state,
+            contract: self,
         }
     }
 
-    pub trait Handlers<State> {
-        type Output: Response + 'static;
+    fn call<M: Message>(
+        &self,
+        env: &Env,
+        state: &mut Self::State,
+        input: M::Input,
+    ) -> Option<M::Output>
+    where
+        Self::Output: Response,
+        Self: Sized,
+        M::Output: 'static,
+        M::Input: EncodeSolidityArgs,
+    {
+        Response::output_for::<M>(self.send_request(env, state, Request::serialize::<M>(input)))
+    }
+}
 
-        fn handle(&self, env: &EthEnv, state: &mut State, request: Request)
-            -> Result<Self::Output>;
+impl<Env, C, H> ContractDef<Env> for Contract<Env, C, H>
+where
+    C: Constructor,
+    H: Handlers<Env, C::State>,
+    C::State: EmptyState,
+    C::Input: DecodeSolidityArgs,
+{
+    type Input = C::Input;
+    type Output = H::Output;
+    type State = C::State;
+
+    fn construct(&self, input: C::Input) -> Self::State {
+        self.constructor.call(input)
     }
 
-    use either::Either;
+    fn send_request(&self, env: &Env, state: &mut C::State, input: Request) -> Self::Output {
+        self.handlers.handle(env, state, input).expect("No method")
+    }
+}
 
-    macro_rules! impl_handlers {
+pub trait Handlers<Env, State> {
+    type Output: Response + 'static;
+
+    fn handle(&self, env: &Env, state: &mut State, request: Request) -> Result<Self::Output>;
+}
+
+use either::Either;
+
+macro_rules! impl_handlers {
         ($statename:ident, $($any:tt)*) => {
-            impl<M, Rest, $statename> Handlers<$statename> for (
+            impl<M, Rest, Env, $statename> Handlers<Env, $statename> for (
                 (
                     PhantomData<M>,
-                    for<'a> fn(&'a EthEnv, &'a $($any)*, M::Input) -> M::Output,
+                    for<'a> fn(&'a Env, &'a $($any)*, M::Input) -> M::Output,
                 ),
                 Rest
             )
@@ -735,12 +886,12 @@ mod pwasm {
                 M: Message,
                 <M as Message>::Input: for<'a> Deserialize<'a>,
                 <M as Message>::Output: 'static,
-                Rest: Handlers<$statename>,
+                Rest: Handlers<Env, $statename>,
             {
-                type Output = Either<<M as Message>::Output, <Rest as Handlers<$statename>>::Output>;
+                type Output = Either<<M as Message>::Output, <Rest as Handlers<Env, $statename>>::Output>;
 
                 // TODO: Pre-hash?
-                fn handle(&self, env: &EthEnv, state: &mut $statename, request: Request) -> Result<Self::Output> {
+                fn handle(&self, env: &Env, state: &mut $statename, request: Request) -> Result<Self::Output> {
                     if M::selector() == request.function_selector() {
                         let head = self.0;
                         let out = (head.1)(env, state, request.deserialize_input_for::<M>()?);
@@ -753,61 +904,54 @@ mod pwasm {
         }
     }
 
-    impl_handlers!(State, State);
-    impl_handlers!(State, mut State);
+impl_handlers!(State, State);
+impl_handlers!(State, mut State);
 
-    pub enum Void {}
+impl<Env, State> Handlers<Env, State> for () {
+    type Output = Void;
 
-    impl<State> Handlers<State> for () {
-        type Output = Void;
-
-        fn handle(
-            &self,
-            _env: &EthEnv,
-            _state: &mut State,
-            _request: Request,
-        ) -> Result<Self::Output> {
-            Err(Error::NoMethodError)
-        }
+    fn handle(&self, _env: &Env, _state: &mut State, _request: Request) -> Result<Self::Output> {
+        Err(Error::NoMethodError)
     }
+}
 
-    pub trait SolidityTypeNames {
-        type Iter: IntoIterator<Item = &'static str>;
-        fn arg_sig() -> Self::Iter;
-    }
+pub trait SolidityTypeNames {
+    type Iter: IntoIterator<Item = &'static str>;
+    fn arg_sig() -> Self::Iter;
+}
 
-    // We use an iterator so that we can implement this with macro_rules macros
-    // without allocating
-    pub trait SolidityType {
-        type Iter: IntoIterator<Item = &'static str>;
-        fn solname() -> Self::Iter;
-    }
+// We use an iterator so that we can implement this with macro_rules macros
+// without allocating
+pub trait SolidityType {
+    type Iter: IntoIterator<Item = &'static str>;
+    fn solname() -> Self::Iter;
+}
 
-    macro_rules! impl_soltype {
-        ($typ:ty, $out:expr) => {
-            impl SolidityType for $typ {
-                type Iter = iter::Once<&'static str>;
+macro_rules! impl_soltype {
+    ($typ:ty, $out:expr) => {
+        impl SolidityType for $typ {
+            type Iter = iter::Once<&'static str>;
 
-                fn solname() -> Self::Iter {
-                    iter::once($out)
-                }
+            fn solname() -> Self::Iter {
+                iter::once($out)
             }
-        };
-    }
+        }
+    };
+}
 
-    impl_soltype!(bool, "bool");
-    impl_soltype!(u8, "uint8");
-    impl_soltype!(u16, "uint16");
-    impl_soltype!(u32, "uint32");
-    impl_soltype!(u64, "uint64");
-    impl_soltype!(i8, "int8");
-    impl_soltype!(i16, "int16");
-    impl_soltype!(i32, "int32");
-    impl_soltype!(i64, "int64");
-    impl_soltype!(U256, "uint256");
-    impl_soltype!(::parity_hash::Address, "address");
+impl_soltype!(bool, "bool");
+impl_soltype!(u8, "uint8");
+impl_soltype!(u16, "uint16");
+impl_soltype!(u32, "uint32");
+impl_soltype!(u64, "uint64");
+impl_soltype!(i8, "int8");
+impl_soltype!(i16, "int16");
+impl_soltype!(i32, "int32");
+impl_soltype!(i64, "int64");
+impl_soltype!(U256, "uint256");
+impl_soltype!(::parity_hash::Address, "address");
 
-    macro_rules! sol_array {
+macro_rules! sol_array {
         (@capture $e:expr) => {
             stringify!($e)
         };
@@ -828,46 +972,44 @@ mod pwasm {
         };
     }
 
-    sol_array!(
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 32, 64, 128, 256, 512, 1024
-    );
+sol_array!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 32, 64, 128, 256, 512, 1024);
 
-    impl<T> SolidityType for Vec<T>
-    where
-        T: SolidityType,
-    {
-        type Iter = iter::Chain<<T::Iter as IntoIterator>::IntoIter, iter::Once<&'static str>>;
+impl<T> SolidityType for Vec<T>
+where
+    T: SolidityType,
+{
+    type Iter = iter::Chain<<T::Iter as IntoIterator>::IntoIter, iter::Once<&'static str>>;
 
-        fn solname() -> Self::Iter {
-            T::solname().into_iter().chain(iter::once("[]"))
-        }
+    fn solname() -> Self::Iter {
+        T::solname().into_iter().chain(iter::once("[]"))
     }
+}
 
-    impl<T> SolidityTypeNames for T
-    where
-        T: SolidityType,
-    {
-        type Iter = iter::Chain<
-            iter::Chain<iter::Once<&'static str>, <T::Iter as IntoIterator>::IntoIter>,
-            iter::Once<&'static str>,
-        >;
+impl<T> SolidityTypeNames for T
+where
+    T: SolidityType,
+{
+    type Iter = iter::Chain<
+        iter::Chain<iter::Once<&'static str>, <T::Iter as IntoIterator>::IntoIter>,
+        iter::Once<&'static str>,
+    >;
 
-        #[inline]
-        fn arg_sig() -> Self::Iter {
-            iter::once("(")
-                .chain(T::solname().into_iter())
-                .chain(iter::once(")"))
-        }
+    #[inline]
+    fn arg_sig() -> Self::Iter {
+        iter::once("(")
+            .chain(T::solname().into_iter())
+            .chain(iter::once(")"))
     }
+}
 
-    macro_rules! tup_sig {
+macro_rules! tup_sig {
         (@chain_type_inner $name:ident) => {
-            <$name::Iter as ::core::iter::IntoIterator>::IntoIter
+            <$name::Iter as ::std::iter::IntoIterator>::IntoIter
         };
         (@chain_type_inner $name:ident $($rest:ident)*) => {
             iter::Chain<
                 iter::Chain<
-                    <$name::Iter as ::core::iter::IntoIterator>::IntoIter,
+                    <$name::Iter as ::std::iter::IntoIterator>::IntoIter,
                     iter::Once<&'static str>,
                 >,
                 tup_sig!(@chain_type_inner $($rest)*),
@@ -912,7 +1054,7 @@ mod pwasm {
         };
     }
 
-    macro_rules! tup_sigs {
+macro_rules! tup_sigs {
         ($name:ident $($rest:ident)*) => {
             tup_sig!($name $(, $rest)*);
             tup_sigs!($($rest)*);
@@ -922,253 +1064,294 @@ mod pwasm {
         };
     }
 
-    // Any more than this and it becomes extremely slow to compile
-    tup_sigs!(A B C D E F G H I J K L M N O P Q);
+// Any more than this and it becomes extremely slow to compile
+tup_sigs!(A B C D E F G H I J K L M N O P Q);
 
-    pub trait Message {
-        type Input: DecodeSolidityArgs + SolidityTypeNames;
-        type Output: EncodeSolidityArgs;
+pub trait Message {
+    type Input: DecodeSolidityArgs + SolidityTypeNames;
+    type Output: SolidityReturnType;
 
-        // TODO: Pre-hash?
-        const NAME: &'static str;
+    // TODO: Pre-hash?
+    const NAME: &'static str;
+}
+
+pub trait MessageExt {
+    type Iter: IntoIterator<Item = &'static str>;
+    fn signature() -> Self::Iter;
+
+    fn selector() -> [u8; 4] {
+        make_selector(Self::signature())
     }
+}
 
-    pub trait MessageExt {
-        type Iter: IntoIterator<Item = &'static str>;
-        fn signature() -> Self::Iter;
+impl<T> MessageExt for T
+where
+    T: Message,
+    T::Input: SolidityTypeNames,
+{
+    type Iter = iter::Chain<
+        iter::Once<&'static str>,
+        <<T::Input as SolidityTypeNames>::Iter as IntoIterator>::IntoIter,
+    >;
 
-        fn selector() -> [u8; 4] {
-            make_selector(Self::signature())
+    fn signature() -> Self::Iter {
+        iter::once(Self::NAME).chain(<Self as Message>::Input::arg_sig().into_iter())
+    }
+}
+
+// This is essentially a hack to get around the fact that `FnOnce`'s internals are
+// unstable
+pub trait Constructor {
+    type State;
+    type Input;
+
+    fn call(&self, input: Self::Input) -> Self::State;
+}
+
+impl<State, I> Constructor for fn(I) -> State {
+    type State = State;
+    type Input = I;
+
+    fn call(&self, input: I) -> Self::State {
+        self(input)
+    }
+}
+
+impl<State> Constructor for fn() -> State {
+    type State = State;
+    type Input = ();
+
+    fn call(&self, _: ()) -> Self::State {
+        self()
+    }
+}
+
+pub struct Contract<Env, Constructor, Handle> {
+    constructor: Constructor,
+    handlers: Handle,
+    _marker: PhantomData<fn() -> Env>,
+}
+
+impl<Env> Contract<Env, (), ()> {
+    // We `inline` all of these because we expect them to be called
+    // only once per program. We don't `inline(always)` because
+    // it's possible that you have multiple contracts.
+    #[inline]
+    pub fn new() -> Self {
+        Contract {
+            constructor: (),
+            handlers: (),
+            _marker: Default::default(),
         }
     }
 
-    impl<T> MessageExt for T
+    // We enforce the `'static` bound here instead of when we check the
+    // `ContractDef` bound so that we get better error messages.
+    //
+    // It's necessary since we serialize the closure's state at deploy-time
+    // and then deserialize it on-chain.
+    //
+    // Also, we shouldn't allow you to put handlers before the constructor,
+    // since that's a footgun (it'll work if the state and init are the same
+    // type but not otherwise).
+    #[inline]
+    pub fn constructor<State, Input>(
+        self,
+        constructor: fn(&Ethereum, Input) -> State,
+    ) -> Contract<Env, fn(&Ethereum, Input) -> State, ()>
     where
-        T: Message,
-        T::Input: SolidityTypeNames,
+        State: EmptyState,
     {
-        type Iter = iter::Chain<
-            iter::Once<&'static str>,
-            <<T::Input as SolidityTypeNames>::Iter as IntoIterator>::IntoIter,
-        >;
+        Contract {
+            constructor: constructor,
+            handlers: self.handlers,
+            _marker: Default::default(),
+        }
+    }
+}
 
-        fn signature() -> Self::Iter {
-            iter::once(Self::NAME).chain(<Self as Message>::Input::arg_sig().into_iter())
+type Handler<M, St> =
+    for<'a> fn(&'a Ethereum, &'a St, <M as Message>::Input) -> <M as Message>::Output;
+type HandlerMut<M, St> =
+    for<'a> fn(&'a Ethereum, &'a mut St, <M as Message>::Input) -> <M as Message>::Output;
+
+impl<Env, Cons, Handle> Contract<Env, Cons, Handle>
+where
+    Cons: Constructor + Copy,
+    Handle: Handlers<Env, Cons::State> + Copy,
+{
+    #[inline(always)]
+    fn with_handler<M, H>(self, handler: H) -> Contract<Env, Cons, ((PhantomData<M>, H), Handle)> {
+        Contract {
+            constructor: self.constructor,
+            handlers: ((PhantomData, handler), self.handlers),
+            _marker: Default::default(),
         }
     }
 
-    // This is essentially a hack to get around the fact that `FnOnce`'s internals are
-    // unstable
-    pub trait Constructor {
-        type State;
-        type Input;
-
-        fn call(&self, state: &mut Self::State, txinfo: Self::Input);
-    }
-
-    impl<State, I> Constructor for fn(&mut State, I) {
-        type State = State;
-        type Input = I;
-
-        fn call(&self, state: &mut Self::State, txinfo: I) {
-            self(state, txinfo)
-        }
-    }
-
-    impl<State> Constructor for fn(&mut State) {
-        type State = State;
-        type Input = ();
-
-        fn call(&self, state: &mut Self::State, _: ()) {
-            self(state)
-        }
-    }
-
-    pub struct Contract<Constructor, Handle> {
-        constructor: Constructor,
-        handlers: Handle,
-    }
-
-    impl Contract<(), ()> {
-        pub fn new() -> Self {
-            Contract {
-                constructor: (),
-                handlers: (),
-            }
-        }
-
-        // We enforce the `'static` bound here instead of when we check the
-        // `ContractDef` bound so that we get better error messages.
-        //
-        // It's necessary since we serialize the closure's state at deploy-time
-        // and then deserialize it on-chain.
-        //
-        // Also, we shouldn't allow you to put handlers before the constructor,
-        // since that's a footgun (it'll work if the state and init are the same
-        // type but not otherwise).
-
-        #[inline(always)]
-        pub fn constructor<State, Input>(
-            self,
-            constructor: fn(&mut State, Input),
-        ) -> Contract<fn(&mut State, Input), ()>
-        where
-            State: Default,
-        {
-            Contract {
-                constructor: constructor,
-                handlers: self.handlers,
-            }
-        }
-    }
-
-    type Handler<M, St> =
-        for<'a> fn(&'a EthEnv, &'a St, <M as Message>::Input) -> <M as Message>::Output;
-    type HandlerMut<M, St> =
-        for<'a> fn(&'a EthEnv, &'a mut St, <M as Message>::Input) -> <M as Message>::Output;
-
-    impl<Cons, Handle> Contract<Cons, Handle>
+    #[inline(always)]
+    pub fn on_msg<M>(
+        self,
+        handler: Handler<M, Cons::State>,
+    ) -> Contract<Env, Cons, ((PhantomData<M>, Handler<M, Cons::State>), Handle)>
     where
-        Cons: Constructor + Copy,
-        Handle: Handlers<Cons::State> + Copy,
+        M: Message,
     {
-        #[inline(always)]
-        fn with_handler<M, H>(self, handler: H) -> Contract<Cons, ((PhantomData<M>, H), Handle)> {
-            Contract {
-                constructor: self.constructor,
-                handlers: ((PhantomData, handler), self.handlers),
-            }
-        }
-
-        #[inline(always)]
-        pub fn on_msg<M>(
-            self,
-            handler: Handler<M, Cons::State>,
-        ) -> Contract<Cons, ((PhantomData<M>, Handler<M, Cons::State>), Handle)>
-        where
-            M: Message,
-        {
-            self.with_handler(handler)
-        }
-
-        #[inline(always)]
-        pub fn on_msg_mut<M>(
-            self,
-            handler: HandlerMut<M, Cons::State>,
-        ) -> Contract<Cons, ((PhantomData<M>, HandlerMut<M, Cons::State>), Handle)>
-        where
-            M: Message,
-        {
-            self.with_handler(handler)
-        }
+        self.with_handler(handler)
     }
 
-    pub struct DeployData {
-        deployer: U256,
+    #[inline(always)]
+    pub fn on_msg_mut<M>(
+        self,
+        handler: HandlerMut<M, Cons::State>,
+    ) -> Contract<Env, Cons, ((PhantomData<M>, HandlerMut<M, Cons::State>), Handle)>
+    where
+        M: Message,
+    {
+        self.with_handler(handler)
+    }
+}
+
+pub struct DeployData {
+    deployer: U256,
+}
+
+// Will it ever be possible to get arbitrary blocks?
+pub struct Block(());
+
+impl Block {
+    pub fn beneficiary(&self) -> U256 {
+        unimplemented!();
     }
 
-    // Will it ever be possible to get arbitrary blocks?
-    pub struct Block(());
-
-    impl Block {
-        pub fn beneficiary(&self) -> U256 {
-            unimplemented!();
-        }
-
-        pub fn timestamp(&self) -> U256 {
-            unimplemented!();
-        }
-
-        pub fn number(&self) -> U256 {
-            unimplemented!();
-        }
-
-        pub fn difficulty(&self) -> U256 {
-            unimplemented!();
-        }
-
-        pub fn gas_limit(&self) -> U256 {
-            unimplemented!();
-        }
+    pub fn timestamp(&self) -> U256 {
+        unimplemented!();
     }
 
-    pub struct Account {
-        address: U256,
+    pub fn number(&self) -> U256 {
+        unimplemented!();
     }
 
-    impl Account {
-        pub fn balance(&self) -> U256 {
-            unimplemented!()
-        }
+    pub fn difficulty(&self) -> U256 {
+        unimplemented!();
     }
 
-    pub struct EthEnv(());
+    pub fn gas_limit(&self) -> U256 {
+        unimplemented!();
+    }
+}
 
-    impl EthEnv {
-        #[cfg(test)]
-        pub fn new() -> Self {
-            EthEnv(())
-        }
+pub struct Account {
+    address: U256,
+}
+
+impl Account {
+    pub fn balance(&self) -> U256 {
+        unimplemented!()
+    }
+}
+
+pub struct Ethereum(());
+
+impl Ethereum {
+    pub fn new() -> Self {
+        Ethereum(())
+    }
+}
+
+pub trait RemoteContract {}
+
+impl HasStorage for Ethereum {
+    type Key = H256;
+    type Value = [u8; 32];
+
+    fn read(key: &Self::Key) -> Self::Value {
+        pwasm_ethereum::read(key)
     }
 
-    pub trait RemoteContract {}
+    fn write(key: &Self::Key, value: &Self::Value) {
+        pwasm_ethereum::write(key, value)
+    }
+}
 
-    impl EthEnv {
-        // TODO: Do we use an owned blockchain since everything's accessed through methods
-        //       anyway?
-        fn blockchain(&self) -> &BlockChain {
-            unimplemented!()
-        }
-
-        fn account_at(&self, _addr: U256) -> Result<Account> {
-            unimplemented!()
-        }
-
-        // We use different types for remote vs local contracts since
-        // they require different functions to get the code
-
-        // `impl Contract` is a `RemoteContract`
-        fn contract_at(&self, _addr: U256) -> Result<&impl RemoteContract> {
-            struct Dummy;
-
-            impl RemoteContract for Dummy {}
-
-            Ok(&Dummy)
-        }
-
-        // `impl Contract` is a `LocalContract`
-        fn current_contract(&self) -> Result<&impl RemoteContract> {
-            struct Dummy;
-
-            impl RemoteContract for Dummy {}
-
-            Ok(&Dummy)
-        }
+impl Ethereum {
+    pub fn blockchain(&self) -> &BlockChain {
+        unimplemented!()
     }
 
-    pub struct BlockChain(());
-
-    impl BlockChain {
-        pub fn current(&self) -> &Block {
-            unimplemented!();
-        }
-
-        pub fn block_hash(&self, _number: u8) -> U256 {
-            unimplemented!();
-        }
+    pub fn account_at(&self, _addr: Address) -> Result<Account> {
+        unimplemented!()
     }
 
-    pub trait ExternalContract {
-        // Compiles to `CODESIZE` + `CODECOPY` (TODO: This should be dynamically-sized but
-        // owned but we can't do that without `alloca`, so we can just write a `Box<[u8]>`-
-        // esque type that allocates on the "heap")
-        fn code(&self) -> &[u8];
-        fn call(&self, method: &[u8], args: &[u8]) -> &[u8];
+    pub fn immediate_caller(&self) -> Address {
+        pwasm_ethereum::sender()
     }
 
+    pub fn original_caller(&self) -> Address {
+        pwasm_ethereum::origin()
+    }
+
+    // We use different types for remote vs local contracts since
+    // they require different functions to get the code
+
+    pub fn contract_at(&self, _addr: Address) -> Result<&impl RemoteContract> {
+        struct Dummy;
+
+        impl RemoteContract for Dummy {}
+
+        Ok(&Dummy)
+    }
+
+    pub fn current_address(&self) -> Address {
+        pwasm_ethereum::address()
+    }
+
+    pub fn current_contract(&self) -> Result<&impl RemoteContract> {
+        struct Dummy;
+
+        impl RemoteContract for Dummy {}
+
+        Ok(&Dummy)
+    }
+}
+
+pub struct BlockChain(());
+
+impl BlockChain {
+    pub fn current(&self) -> &Block {
+        unimplemented!();
+    }
+
+    pub fn block_hash(&self, _number: u8) -> U256 {
+        unimplemented!();
+    }
+}
+
+pub trait ExternalContract {
+    // Compiles to `CODESIZE` + `CODECOPY` (TODO: This should be dynamically-sized but
+    // owned but we can't do that without `alloca`, so we can just write a `Box<[u8]>`-
+    // esque type that allocates on the "heap")
+    fn code(&self) -> &[u8];
+    fn call(&self, method: &[u8], args: &[u8]) -> &[u8];
 }
 
 macro_rules! state {
+    (@fields $name:ident $( $field:ident : $typ:ty, )*) => {
+        mod $name {
+            $(
+                #[allow(non_camel_case_types)]
+                #[derive(Default)]
+                pub struct $field;
+
+                impl $crate::FieldName for $field {
+                    #[inline]
+                    fn name(&self) -> &'static str {
+                        stringify!($field)
+                    }
+                }
+            )*
+        }
+    };
     (
         struct $name:ident {
             $(
@@ -1177,16 +1360,22 @@ macro_rules! state {
             $(,)*
         }
     ) => {
-        struct $name {
-            __inner: ::std::marker::PhantomData<$name>,
+        struct $name<Env: $crate::HasStorage> {
+            $(
+                $field: $crate::Field<Env, $typ, fields::$field>,
+            )*
+        }
+
+        impl<E: $crate::HasStorage> $crate::EmptyState for $name<E> {
+            fn empty() -> Self {
+                $name {
+                    $( $field : $crate::Field::default(), )*
+                }
+            }
         }
 
         state! {
-            @impl $name {
-                $(
-                    $field : $typ
-                ),*
-            }
+            @fields fields $( $field : $typ, )*
         }
     };
     (
@@ -1197,49 +1386,22 @@ macro_rules! state {
             $(,)*
         }
     ) => {
-        pub struct $name {
-            __inner: ::std::marker::PhantomData<$name>,
-        }
-
-        state! {
-            @impl $name {
-                $(
-                    $field : $typ
-                ),*
-            }
-        }
-    };
-    (
-        @impl $name:ident {
+        pub struct $name<Env: $crate::HasStorage> {
             $(
-                $field:ident : $typ:ty
-            ),*
-            $(,)*
-        }
-    ) => {
-        impl Default for $name {
-            fn default() -> Self {
-                $name {
-                    __inner: ::std::marker::PhantomData,
-                }
-            }
-        }
-
-        pub trait __State<'a>: Sized {
-            type Marker: $crate::pwasm::marker::BorrowMarker;
-            $(
-                fn $field(self) -> $crate::pwasm::Field<'a, Self::Marker, $typ> {
-                    $crate::pwasm::Field::new(stringify!($field))
-                }
+                $field: $crate::Field<Env, $typ, fields::$field>,
             )*
         }
 
-        impl<'a> __State<'a> for &'a mut $name {
-            type Marker = $crate::pwasm::marker::Mut;
+        impl<E: $crate::HasStorage> $crate::EmptyState for $name<E> {
+            fn empty() -> Self {
+                $name {
+                    $( $field : $crate::Field::default(), )*
+                }
+            }
         }
 
-        impl<'a> __State<'a> for &'a $name {
-            type Marker = $crate::pwasm::marker::Immut;
+        state! {
+            @fields fields $( $field : $typ, )*
         }
     };
 }
@@ -1251,7 +1413,7 @@ macro_rules! messages {
     ($name:ident($($typ:ty),*) -> $out:ty; $($rest:tt)*) => {
         struct $name;
 
-        impl $crate::pwasm::Message for $name {
+        impl $crate::Message for $name {
             type Input = ($($typ),*);
             type Output = $out;
 
@@ -1263,8 +1425,30 @@ macro_rules! messages {
     () => {}
 }
 
+macro_rules! contract {
+    ($contract_fn:path) => {
+        #[no_mangle]
+        pub fn call() {
+            use $crate::Response;
+
+            ::pwasm_ethereum::ret(&$contract_fn()
+                .send_request(
+                    &$crate::Ethereum::new(),
+                    &mut $crate::EmptyState::empty(),
+                    $crate::Request::new(::pwasm_ethereum::input()).expect("Invalid request"),
+                )
+                .serialize());
+        }
+
+        #[no_mangle]
+        pub fn deploy() {
+            &$contract_fn().construct_raw(&::pwasm_ethereum::input());
+        }
+    };
+}
+
 mod example {
-    use pwasm::{Contract, ContractDef};
+    use {Contract, ContractDef};
 
     messages! {
         Add(u32);
@@ -1278,25 +1462,31 @@ mod example {
         }
     }
 
-    pub fn contract() -> impl ContractDef {
+    pub fn contract<Env>() -> impl ContractDef<Env> {
         Contract::new()
-            .constructor(|state: &mut State, ()| {
-                state.current().insert(1);
-                state.calls_to_add().insert(0);
+            .constructor(|_, ()| State {
+                current: 1.into(),
+                calls_to_add: 0.into(),
             })
             .on_msg_mut::<Add>(|_env, state, to_add| {
-                *state.calls_to_add() += 1;
-                *state.current() += to_add;
+                *state.calls_to_add += 1;
+                *state.current += to_add;
             })
-            .on_msg::<Get>(|_env, state, ()| *state.current())
+            .on_msg::<Get>(|_env, state, ()| *state.current)
     }
+
+    contract!(contract);
 }
 
-#[cfg(test)]
+pub use example::{call, deploy};
+
+#[cfg(all(feature = "std", test))]
 mod test {
+    use alloc::{String, Vec};
+
     #[test]
     fn tuple_sigs() {
-        use pwasm::SolidityTypeNames;
+        use SolidityTypeNames;
 
         assert_eq!(
             <(u8, i32, u32)>::arg_sig().collect::<String>(),
@@ -1306,7 +1496,7 @@ mod test {
 
     #[test]
     fn message_sigs() {
-        use pwasm::MessageExt;
+        use MessageExt;
 
         messages! {
             Foo(u32, u64, i32);
@@ -1334,15 +1524,10 @@ mod test {
     fn real_world_message_sigs() {
         #![allow(non_camel_case_types)]
 
-        use ::pwasm::MessageExt;
+        use MessageExt;
 
         fn to_byte_array(i: u32) -> [u8; 4] {
-            [
-                (i >> 24) as u8,
-                (i >> 16) as u8,
-                (i >> 8) as u8,
-                i as u8,
-            ]
+            [(i >> 24) as u8, (i >> 16) as u8, (i >> 8) as u8, i as u8]
         }
 
         use bigint::U256;
@@ -1365,7 +1550,7 @@ mod test {
     fn request() {
         #![allow(non_camel_case_types)]
 
-        use pwasm::Request;
+        use Request;
 
         messages! {
             foo(u32, u64, i32);
@@ -1376,7 +1561,7 @@ mod test {
 
     #[test]
     fn contract() {
-        use pwasm::{Contract, ContractDef, EthEnv};
+        use {Contract, ContractDef, Ethereum};
 
         messages! {
             Add(u32);
@@ -1395,37 +1580,37 @@ mod test {
         }
 
         // TODO: Probably you won't be able to create a new instance of the "proper"
-        //       `EthEnv`, only a dummy version.
-        let env = EthEnv::new();
+        //       `Ethereum`, only a dummy version.
+        let env = Ethereum::new();
 
         let definition = Contract::new()
-            .constructor(|state: &mut State, _txdata| {
-                state.current().insert(1);
-                state.calls_to_add().insert(0);
-                state.vec().insert((0..1024usize).collect::<Vec<_>>());
+            .constructor(|_, _txdata| State {
+                current: 1.into(),
+                calls_to_add: 0.into(),
+                vec: (0..1024usize).collect::<Vec<_>>().into(),
             })
             .on_msg_mut::<Add>(|_env, state, to_add| {
-                *state.calls_to_add() += 1;
-                *state.current() += to_add;
+                *state.calls_to_add += 1;
+                *state.current += to_add;
             })
-            .on_msg::<Get>(|_env, state, ()| *state.current())
+            .on_msg::<Get>(|_env, state, ()| *state.current)
             .on_msg::<GetNoMacro>(|_env, _state, ()| {
-                use pwasm::Field;
+                use Field;
 
                 static CURRENT: &str = "current";
 
-                let val: u32 = *Field::get(CURRENT);
+                let val: u32 = *Field::read(CURRENT);
                 // No safety rails here, you can modify the state in an "immutable"
                 // message handler. This will fail if you were called with `call_static`
                 // however
-                Field::set(CURRENT, 10u32);
-                let out = *Field::get(CURRENT);
-                Field::set(CURRENT, val);
+                Field::write(CURRENT, 10u32);
+                let out = *Field::read(CURRENT);
+                Field::write(CURRENT, val);
 
                 out
             })
             .on_msg::<AssertVec>(|_env, state, ()| {
-                assert_eq!(*state.vec(), (0..1024usize).collect::<Vec<_>>());
+                assert_eq!(*state.vec, (0..1024usize).collect::<Vec<_>>());
             });
 
         let mut contract = definition.deploy(&env, ());
@@ -1438,7 +1623,79 @@ mod test {
 
         assert_eq!(val_no_macro, 10);
         assert_eq!(val, 2);
-        assert_eq!(*contract.state.current(), 2,);
-        assert_eq!(*contract.state.calls_to_add(), 1,);
+        assert_eq!(*contract.state.current, 2);
+        assert_eq!(*contract.state.calls_to_add, 1);
+    }
+
+    #[test]
+    fn erc20() {
+        use bigint::U256;
+        use parity_hash::Address;
+        use {Contract, ContractDef, Database, Ethereum};
+
+        messages! {
+            TotalSupply() -> U256;
+            BalanceOf(Address) -> U256;
+            Transfer(Address, U256) -> bool;
+        }
+
+        state! {
+            struct State {
+                balances: Database<Address, U256>,
+                total: U256,
+            }
+        }
+
+        // TODO: Probably you won't be able to create a new instance of the "proper"
+        //       `Ethereum`, only a dummy version.
+        let env = Ethereum::new();
+
+        let definition = Contract::new()
+            .constructor(|_, total_supply: U256| {
+                let mut database = Database::new();
+                database.insert(&Address::default(), total_supply.clone());
+                State {
+                    total: total_supply.into(),
+                    balances: database.into(),
+                }
+            })
+            .on_msg::<BalanceOf>(|_env, state, address| state.balances.get(&address))
+            .on_msg::<TotalSupply>(|_env, state, ()| *state.total)
+            .on_msg_mut::<Transfer>(|env, state, (to, amount)| {
+                if amount == U256::zero() {
+                    return false;
+                }
+                let from = env.original_caller();
+
+                let existing_from = state.balances.get(&from);
+                let existing_to = state.balances.get(&to);
+
+                if existing_from >= amount {
+                    state.balances.insert(&from, existing_from - amount);
+                    state.balances.insert(&to, existing_to + amount);
+
+                    true
+                } else {
+                    false
+                }
+            });
+
+        let total = U256::from(1_000_000u64);
+        let transfer_to = Address::from(&[123; 160][..]);
+        let mut contract = definition.deploy(&env, total.clone());
+
+        let total_in_contract = contract.call::<TotalSupply>(());
+        let balance = contract.call::<BalanceOf>(Address::default());
+        let empty_balance = contract.call::<BalanceOf>(transfer_to);
+        let success = contract.call::<Transfer>((transfer_to, 1_000u64.into()));
+        let failure = !contract.call::<Transfer>((transfer_to, 1_000_000u64.into()));
+        let post_transfer_balance = contract.call::<BalanceOf>(transfer_to);
+
+        assert!(success);
+        assert!(failure);
+        assert!(total_in_contract == total);
+        assert!(balance == total);
+        assert!(empty_balance == U256::zero());
+        assert!(post_transfer_balance == U256::from(1_000u64));
     }
 }
