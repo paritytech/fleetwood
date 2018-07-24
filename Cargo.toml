@@ -8,15 +8,12 @@ lazy_static = "1.0"
 serde = "1.0"
 serde_derive = "1.0"
 either = "1.5"
-tiny-keccak = { path = "../tiny-keccak/" }
-bincode = "*"
+tiny-keccak = "1.4"
+bincode = "1.0"
 metrohash = "1.0"
 parity-hash = { version = "1.2", features = ["serialize"] }
 bigint = { version = "4.3.0", features = ["serialize"] }
 pwasm-abi = { version = "0.1", features = ["std"] }
-
-[patch.crates-io]
-wee_alloc = { git = "https://github.com/rustwasm/wee_alloc.git" }
 
 [features]
 default = []
