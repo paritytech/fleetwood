@@ -280,7 +280,7 @@ impl<'a, Env: environment::HasStorage> StateWriter<'a, Env> {
     }
 
     fn flush_internal(&self) {
-        Env::write(&Env::Key::from_u64(quickhash(self.key.as_ref())), &self.val);
+        Env::write(self.key, self.val);
     }
 }
 
@@ -382,7 +382,11 @@ impl<Env: environment::HasStorage, K: Hash, V: Serialize + for<'a> Deserialize<'
         let mut hasher = self.builder.build_hasher();
         key.hash(&mut hasher);
 
-        Env::Key::from_u64(hasher.finish())
+        let hash =hasher.finish();
+
+        println!("{}", hash);
+
+        Env::Key::from_u64(hash)
     }
 
     pub fn insert(&mut self, key: &K, val: V) {
@@ -1140,6 +1144,21 @@ impl DummyEnv {
     pub fn new() -> Self {
         DummyEnv(())
     }
+
+    pub fn immediate_caller(&self) -> Address {
+        dummy::sender()
+    }
+
+    pub fn original_caller(&self) -> Address {
+        dummy::origin()
+    }
+
+    // We use different types for remote vs local contracts since
+    // they require different functions to get the code
+
+    pub fn current_address(&self) -> Address {
+        dummy::address()
+    }
 }
 
 pub trait RemoteContract {}
@@ -1154,23 +1173,6 @@ impl environment::HasStorage for DummyEnv {
 
     fn write(key: &Self::Key, value: &Self::Value) {
         dummy::write(key, value)
-    }
-}
-
-impl DummyEnv {
-    pub fn immediate_caller(&self) -> Address {
-        dummy::sender()
-    }
-
-    pub fn original_caller(&self) -> Address {
-        dummy::origin()
-    }
-
-    // We use different types for remote vs local contracts since
-    // they require different functions to get the code
-
-    pub fn current_address(&self) -> Address {
-        dummy::address()
     }
 }
 
@@ -1473,7 +1475,7 @@ mod test {
         let mut contract = definition.deploy(&mut env, total.clone());
 
         let total_in_contract = contract.call::<TotalSupply>(());
-        let balance = contract.call::<BalanceOf>(Address::default());
+        let balance = contract.call::<BalanceOf>(DummyEnv::new().original_caller());
         let empty_balance = contract.call::<BalanceOf>(transfer_to);
         let success = contract.call::<Transfer>((transfer_to, 1_000u64.into()));
         let failure = !contract.call::<Transfer>((transfer_to, 1_000_000u64.into()));
