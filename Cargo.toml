@@ -11,9 +11,8 @@ either = "1.5"
 tiny-keccak = "1.4"
 bincode = "1.0"
 metrohash = "1.0"
-parity-hash = { version = "1.2", features = ["serialize"] }
-bigint = { version = "4.3.0", features = ["serialize"] }
-pwasm-abi = { version = "0.1", features = ["std"] }
+pwasm-abi = { version = "0.2", features = ["std"] }
+pwasm-std = { version = "0.13" }
 
 [features]
 default = []
