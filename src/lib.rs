@@ -23,20 +23,21 @@ extern crate lazy_static;
 #[macro_use]
 extern crate serde_derive;
 
-extern crate bigint;
 extern crate bincode;
 extern crate either;
 extern crate metrohash;
-extern crate parity_hash;
+extern crate pwasm_std;
 extern crate pwasm_abi;
 extern crate serde;
 extern crate tiny_keccak;
 
-use bigint::U256;
 use environment::{Key, Value};
 use metrohash::MetroHash;
-use parity_hash::{Address, H256};
-use pwasm_abi::eth::{Sink, Stream};
+use pwasm_std::types::{Address, H256};
+use pwasm_abi::{
+    eth::{Sink, Stream},
+    types::U256,
+};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::cell::{Cell, UnsafeCell};
@@ -524,8 +525,8 @@ macro_rules! impl_solidityargs_abitype {
 impl_solidityargs_abitype! {
     Vec<u8>,
     U256,
-    ::parity_hash::Address,
-    ::parity_hash::H256,
+    pwasm_std::types::Address,
+    pwasm_std::types::H256,
     u32,
     u64,
     i32,
@@ -874,7 +875,7 @@ impl_soltype!(i16, "int16");
 impl_soltype!(i32, "int32");
 impl_soltype!(i64, "int64");
 impl_soltype!(U256, "uint256");
-impl_soltype!(::parity_hash::Address, "address");
+impl_soltype!(pwasm_std::types::Address, "address");
 
 macro_rules! sol_array {
     (@capture $e:expr) => {
@@ -1336,8 +1337,8 @@ mod test {
             [(i >> 24) as u8, (i >> 16) as u8, (i >> 8) as u8, i as u8]
         }
 
-        use bigint::U256;
-        use parity_hash::Address;
+        use pwasm_abi::types::U256;
+        use pwasm_std::types::Address;
 
         messages! {
             totalSupply() -> U256;
@@ -1417,8 +1418,8 @@ mod test {
 
     #[test]
     fn erc20() {
-        use bigint::U256;
-        use parity_hash::Address;
+        use pwasm_abi::types::U256;
+        use pwasm_std::types::Address;
         use {Contract, ContractDef, Database, DummyEnv};
 
         messages! {
@@ -1471,7 +1472,7 @@ mod test {
             });
 
         let total = U256::from(1_000_000u64);
-        let transfer_to = Address::from(&[123; 160][..]);
+        let transfer_to = Address::from([123; 160]);
         let mut contract = definition.deploy(&mut env, total.clone());
 
         let total_in_contract = contract.call::<TotalSupply>(());

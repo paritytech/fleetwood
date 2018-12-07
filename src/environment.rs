@@ -1,4 +1,4 @@
-use parity_hash::H256;
+use pwasm_std::types::H256;
 use std::io::{self, Cursor};
 
 pub enum Writeable<'a> {
@@ -80,7 +80,7 @@ impl Key for H256 {
         out[5] = (val << 16) as u8;
         out[6] = (val << 8) as u8;
         out[7] = val as u8;
-        H256(out)
+        H256::from(out)
     }
 }
 
