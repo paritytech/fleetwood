@@ -26,3 +26,7 @@ As of now Fleetwood is a usable minimum viable product. It is possible to write 
 ## Development
 
 The majority of work is currently put into the new implementation with codename [pDSL](https://github.com/Robbepop/pdsl) featuring the same goals and key attributes as set by Fleetwood. It is targeted for [SRML contracts](https://github.com/paritytech/substrate/tree/master/srml/contract) shipped by [Substrate](https://github.com/paritytech/substrate) and under heavy development.
+
+## Future Work
+
+It would be nice to be able to write smart contracts that are easily compiled for different chains with no runtime overhead while allowing to use specific details of the underlying chain. While developing the Fleetwood technology stack we are trying to uphold this future goal by considering interoperability of new features in accordance to it.
