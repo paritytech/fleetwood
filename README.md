@@ -18,7 +18,6 @@ An [eDSL](https://en.wikipedia.org/wiki/Domain-specific_language) library for wr
 | **Efficienct** | Compile smart contract code to machine code that is _at least_ as efficient as if you used the low-level pWasm function calls directly. |
 | **Robust** | Make it as simple as possible to write code that just does what is expected and as difficult as possible to write incorrect or exploitable code. |
 | **Simple** | Smart contract code should be as easy-to-read as possible. Ideally, even if you are not familiar with Fleetwood. |
-| **Cross-Chain** | Write smart contracts that easily compile for different chains with no runtime overhead while allowing to use specific details of chains. |
 
 ## Current State
 
