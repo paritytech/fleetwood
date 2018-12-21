@@ -1204,46 +1204,14 @@ macro_rules! state {
         }
     };
     (
-        struct $name:ident {
+        $visibility:vis struct $name:ident {
             $(
                 $field:ident : $typ:ty
             ),*
             $(,)*
         }
     ) => {
-        struct $name<Env: $crate::environment::HasStorage> {
-            $(
-                $field: $crate::Field<Env, $typ, fields::$field>,
-            )*
-        }
-
-        impl<E: $crate::environment::HasStorage> $crate::ContractState for $name<E> {
-            fn empty() -> Self {
-                $name {
-                    $( $field : $crate::Field::default(), )*
-                }
-            }
-
-            fn flush(&mut self) {
-                $(
-                    self.$field.flush();
-                )*
-            }
-        }
-
-        state! {
-            @fields fields $( $field : $typ, )*
-        }
-    };
-    (
-        pub struct $name:ident {
-            $(
-                $field:ident : $typ:ty
-            ),*
-            $(,)*
-        }
-    ) => {
-        pub struct $name<Env: $crate::environment::HasStorage> {
+        $visibility struct $name<Env: $crate::environment::HasStorage> {
             $(
                 $field: $crate::Field<Env, $typ, fields::$field>,
             )*
